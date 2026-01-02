@@ -1,3 +1,5 @@
+# Maintainer: Ali <avileli@outlook.com>
+
 pkgname=termilyon
 pkgver=0.1.0
 pkgrel=1
