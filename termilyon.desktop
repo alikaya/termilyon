@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Termilyon
+Comment=GTK4+VTE tabbed terminal emulator
+Exec=termilyon
+Icon=termilyon
+Terminal=false
+Categories=System;TerminalEmulator;
