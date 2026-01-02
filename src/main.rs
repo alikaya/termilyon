@@ -50,6 +50,10 @@ struct KeyBindings {
     close_panel: KeyBinding,
     split_vertical: KeyBinding,
     split_horizontal: KeyBinding,
+    focus_left: KeyBinding,
+    focus_right: KeyBinding,
+    focus_up: KeyBinding,
+    focus_down: KeyBinding,
     tab_switch: Vec<KeyBinding>,
 }
 
@@ -67,6 +71,10 @@ struct RawKeyBindings {
     close_panel: Option<String>,
     split_vertical: Option<String>,
     split_horizontal: Option<String>,
+    focus_left: Option<String>,
+    focus_right: Option<String>,
+    focus_up: Option<String>,
+    focus_down: Option<String>,
     tab_1: Option<String>,
     tab_2: Option<String>,
     tab_3: Option<String>,
@@ -217,6 +225,30 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             return gtk::glib::Propagation::Stop;
         }
 
+        if config_clone.keybindings.focus_left.matches(key, state) {
+            if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Left) {
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
+        if config_clone.keybindings.focus_right.matches(key, state) {
+            if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Right) {
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
+        if config_clone.keybindings.focus_up.matches(key, state) {
+            if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Up) {
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
+        if config_clone.keybindings.focus_down.matches(key, state) {
+            if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Down) {
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
         for (index, binding) in config_clone.keybindings.tab_switch.iter().enumerate() {
             if binding.matches(key, state) {
                 let target = index as u32;
@@ -337,8 +369,14 @@ fn split_current_tab(
 ) {
     let Some(page) = notebook.current_page() else { return };
     let Some(root) = notebook.nth_page(Some(page)) else { return };
-    let Ok(root_box) = root.downcast::<gtk::Box>() else { return };
-    let Some(existing_child) = root_box.first_child() else { return };
+    let Ok(root_box) = root.clone().downcast::<gtk::Box>() else { return };
+
+    let existing_child = find_root_window(&root.upcast::<gtk::Widget>())
+        .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+        .and_then(|focus| find_scrolled_ancestor(&focus))
+        .map(|scrolled| scrolled.upcast::<gtk::Widget>())
+        .or_else(|| root_box.first_child());
+    let Some(existing_child) = existing_child else { return };
 
     let new_terminal = create_terminal_widget(config);
     let paned = gtk::Paned::new(orientation);
@@ -346,10 +384,10 @@ fn split_current_tab(
     paned.set_hexpand(true);
     paned.set_vexpand(true);
 
-    root_box.remove(&existing_child);
+    replace_widget_in_parent(&existing_child, paned.upcast_ref());
+
     paned.set_start_child(Some(&existing_child));
     paned.set_end_child(Some(&new_terminal.scrolled));
-    root_box.append(&paned);
     new_terminal.terminal.grab_focus();
 }
 
@@ -358,6 +396,91 @@ fn close_focused_panel(window: &gtk::Window, notebook: &gtk::Notebook) -> bool {
     let Some(scrolled) = find_scrolled_ancestor(&focus) else { return false };
     close_scrolled_widget(window, notebook, &scrolled);
     true
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+fn focus_adjacent_split(window: &gtk::Window, direction: FocusDirection) -> bool {
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else { return false };
+    let Some(scrolled) = find_scrolled_ancestor(&focus) else { return false };
+    let Some(target) = find_adjacent_terminal(&scrolled, direction) else { return false };
+    target.grab_focus();
+    true
+}
+
+fn find_adjacent_terminal(
+    scrolled: &gtk::ScrolledWindow,
+    direction: FocusDirection,
+) -> Option<Terminal> {
+    let mut current = scrolled.clone().upcast::<gtk::Widget>();
+    let target_orientation = match direction {
+        FocusDirection::Left | FocusDirection::Right => gtk::Orientation::Horizontal,
+        FocusDirection::Up | FocusDirection::Down => gtk::Orientation::Vertical,
+    };
+
+    loop {
+        let parent = current.parent()?;
+        if let Ok(paned) = parent.clone().downcast::<gtk::Paned>() {
+            if paned.orientation() == target_orientation {
+                let start = paned.start_child();
+                let end = paned.end_child();
+                let sibling = match direction {
+                    FocusDirection::Left if end.as_ref() == Some(&current) => start,
+                    FocusDirection::Right if start.as_ref() == Some(&current) => end,
+                    FocusDirection::Up if end.as_ref() == Some(&current) => start,
+                    FocusDirection::Down if start.as_ref() == Some(&current) => end,
+                    _ => None,
+                };
+                if let Some(sibling) = sibling {
+                    if let Some(terminal) = find_terminal_in_widget(&sibling) {
+                        return Some(terminal);
+                    }
+                }
+            }
+        }
+        current = parent;
+    }
+}
+
+fn find_terminal_in_widget(widget: &gtk::Widget) -> Option<Terminal> {
+    if let Ok(terminal) = widget.clone().downcast::<Terminal>() {
+        return Some(terminal);
+    }
+    if let Ok(scrolled) = widget.clone().downcast::<gtk::ScrolledWindow>() {
+        if let Some(child) = scrolled.child() {
+            if let Some(terminal) = find_terminal_in_widget(&child) {
+                return Some(terminal);
+            }
+        }
+    }
+    if let Ok(paned) = widget.clone().downcast::<gtk::Paned>() {
+        if let Some(child) = paned.start_child() {
+            if let Some(terminal) = find_terminal_in_widget(&child) {
+                return Some(terminal);
+            }
+        }
+        if let Some(child) = paned.end_child() {
+            if let Some(terminal) = find_terminal_in_widget(&child) {
+                return Some(terminal);
+            }
+        }
+    }
+
+    let mut child = widget.first_child();
+    while let Some(node) = child {
+        if let Some(terminal) = find_terminal_in_widget(&node) {
+            return Some(terminal);
+        }
+        child = node.next_sibling();
+    }
+
+    None
 }
 
 fn close_scrolled_widget(
@@ -606,6 +729,10 @@ fn default_keybindings() -> KeyBindings {
         close_panel: parse_keybinding("Ctrl+D").unwrap(),
         split_vertical: parse_keybinding("Ctrl+Shift+V").unwrap(),
         split_horizontal: parse_keybinding("Ctrl+Shift+H").unwrap(),
+        focus_left: parse_keybinding("Alt+Left").unwrap(),
+        focus_right: parse_keybinding("Alt+Right").unwrap(),
+        focus_up: parse_keybinding("Alt+Up").unwrap(),
+        focus_down: parse_keybinding("Alt+Down").unwrap(),
         tab_switch: (1..=9)
             .map(|n| parse_keybinding(&format!("Alt+{n}")).unwrap())
             .collect(),
@@ -630,6 +757,18 @@ fn apply_keybindings(bindings: &mut KeyBindings, raw: RawKeyBindings) {
     }
     if let Some(value) = raw.split_horizontal.and_then(|s| parse_keybinding(&s)) {
         bindings.split_horizontal = value;
+    }
+    if let Some(value) = raw.focus_left.and_then(|s| parse_keybinding(&s)) {
+        bindings.focus_left = value;
+    }
+    if let Some(value) = raw.focus_right.and_then(|s| parse_keybinding(&s)) {
+        bindings.focus_right = value;
+    }
+    if let Some(value) = raw.focus_up.and_then(|s| parse_keybinding(&s)) {
+        bindings.focus_up = value;
+    }
+    if let Some(value) = raw.focus_down.and_then(|s| parse_keybinding(&s)) {
+        bindings.focus_down = value;
     }
 
     let tabs = [

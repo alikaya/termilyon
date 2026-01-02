@@ -51,6 +51,10 @@ rename_tab = "Ctrl+Shift+R"
 close_panel = "Ctrl+D"
 split_vertical = "Ctrl+Shift+V"
 split_horizontal = "Ctrl+Shift+H"
+focus_left = "Alt+Left"
+focus_right = "Alt+Right"
+focus_up = "Alt+Up"
+focus_down = "Alt+Down"
 tab_1 = "Alt+1"
 tab_2 = "Alt+2"
 tab_3 = "Alt+3"
@@ -122,6 +126,7 @@ Defaults (all can be changed via config):
 - `Ctrl+D`: close focused panel (close tab/window if last)
 - `Ctrl+Shift+V`: split vertical (left/right)
 - `Ctrl+Shift+H`: split horizontal (top/bottom)
+- `Alt+Left/Right/Up/Down`: move focus between splits
 - `Alt+1..9`: switch tab
 
 ## Split/Exit Behavior
