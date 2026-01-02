@@ -3,12 +3,12 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="GTK4+VTE tabbed terminal emulator"
 arch=('x86_64')
-url="https://github.com/REPLACE_ME/termilyon"
+url="https://github.com/alikaya/termilyon"
 license=('MIT')
 depends=('gtk4' 'vte4')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8fc08a20596880899b1459b019bfba859a91c3ed551fa525451efd3f90746e0f')
 
 prepare() {
   cd "$pkgname-$pkgver"
