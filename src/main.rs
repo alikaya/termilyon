@@ -11,7 +11,7 @@ use gtk::gdk;
 use gtk::prelude::*;
 use serde::Deserialize;
 use vte4::prelude::*;
-use vte4::{PtyFlags, Terminal};
+use vte4::{Format, PtyFlags, Terminal};
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -50,6 +50,8 @@ struct KeyBindings {
     close_panel: KeyBinding,
     split_vertical: KeyBinding,
     split_horizontal: KeyBinding,
+    copy: KeyBinding,
+    paste: KeyBinding,
     focus_left: KeyBinding,
     focus_right: KeyBinding,
     focus_up: KeyBinding,
@@ -71,6 +73,8 @@ struct RawKeyBindings {
     close_panel: Option<String>,
     split_vertical: Option<String>,
     split_horizontal: Option<String>,
+    copy: Option<String>,
+    paste: Option<String>,
     focus_left: Option<String>,
     focus_right: Option<String>,
     focus_up: Option<String>,
@@ -223,6 +227,20 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         {
             split_current_tab(&notebook_clone, &config_clone, gtk::Orientation::Vertical);
             return gtk::glib::Propagation::Stop;
+        }
+
+        if config_clone.keybindings.copy.matches(key, state) {
+            if let Some(terminal) = focused_terminal(window_clone.upcast_ref()) {
+                terminal.copy_clipboard_format(Format::Text);
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
+        if config_clone.keybindings.paste.matches(key, state) {
+            if let Some(terminal) = focused_terminal(window_clone.upcast_ref()) {
+                terminal.paste_clipboard();
+                return gtk::glib::Propagation::Stop;
+            }
         }
 
         if config_clone.keybindings.focus_left.matches(key, state) {
@@ -412,6 +430,14 @@ fn focus_adjacent_split(window: &gtk::Window, direction: FocusDirection) -> bool
     let Some(target) = find_adjacent_terminal(&scrolled, direction) else { return false };
     target.grab_focus();
     true
+}
+
+fn focused_terminal(window: &gtk::Window) -> Option<Terminal> {
+    let focus = gtk::prelude::GtkWindowExt::focus(window)?;
+    find_terminal_in_widget(&focus).or_else(|| {
+        find_scrolled_ancestor(&focus)
+            .and_then(|scrolled| find_terminal_in_widget(scrolled.upcast_ref()))
+    })
 }
 
 fn find_adjacent_terminal(
@@ -727,8 +753,10 @@ fn default_keybindings() -> KeyBindings {
         close_tab: parse_keybinding("Ctrl+Shift+W").unwrap(),
         rename_tab: parse_keybinding("Ctrl+Shift+R").unwrap(),
         close_panel: parse_keybinding("Ctrl+D").unwrap(),
-        split_vertical: parse_keybinding("Ctrl+Shift+V").unwrap(),
+        split_vertical: parse_keybinding("Ctrl+Shift+P").unwrap(),
         split_horizontal: parse_keybinding("Ctrl+Shift+H").unwrap(),
+        copy: parse_keybinding("Ctrl+Shift+C").unwrap(),
+        paste: parse_keybinding("Ctrl+Shift+V").unwrap(),
         focus_left: parse_keybinding("Alt+Left").unwrap(),
         focus_right: parse_keybinding("Alt+Right").unwrap(),
         focus_up: parse_keybinding("Alt+Up").unwrap(),
@@ -757,6 +785,12 @@ fn apply_keybindings(bindings: &mut KeyBindings, raw: RawKeyBindings) {
     }
     if let Some(value) = raw.split_horizontal.and_then(|s| parse_keybinding(&s)) {
         bindings.split_horizontal = value;
+    }
+    if let Some(value) = raw.copy.and_then(|s| parse_keybinding(&s)) {
+        bindings.copy = value;
+    }
+    if let Some(value) = raw.paste.and_then(|s| parse_keybinding(&s)) {
+        bindings.paste = value;
     }
     if let Some(value) = raw.focus_left.and_then(|s| parse_keybinding(&s)) {
         bindings.focus_left = value;
