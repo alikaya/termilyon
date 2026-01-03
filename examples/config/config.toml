@@ -3,6 +3,7 @@ font = "Fira Code 12"
 font_size = 12
 shell = "/bin/bash"
 tab_title = "Terminal"
+tab_bar_position = "top"
 theme_file = "themes/catppuccin-mocha.toml"
 
 [keybindings]
@@ -14,6 +15,8 @@ split_vertical = "Ctrl+Shift+P"
 split_horizontal = "Ctrl+Shift+H"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
+reload_config = "Ctrl+Shift+L"
+show_keybindings = "Ctrl+Shift+K"
 focus_left = "Alt+Left"
 focus_right = "Alt+Right"
 focus_up = "Alt+Up"

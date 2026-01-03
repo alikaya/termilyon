@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ struct Config {
     font_size: i32,
     shell: String,
     tab_title: String,
+    tab_bar_position: gtk::PositionType,
     theme_file: Option<PathBuf>,
     keybindings: KeyBindings,
 }
@@ -31,6 +32,7 @@ struct RawConfig {
     font_size: Option<i32>,
     shell: Option<String>,
     tab_title: Option<String>,
+    tab_bar_position: Option<String>,
     theme_file: Option<String>,
     keybindings: Option<RawKeyBindings>,
 }
@@ -52,6 +54,8 @@ struct KeyBindings {
     split_horizontal: KeyBinding,
     copy: KeyBinding,
     paste: KeyBinding,
+    reload_config: KeyBinding,
+    show_keybindings: KeyBinding,
     focus_left: KeyBinding,
     focus_right: KeyBinding,
     focus_up: KeyBinding,
@@ -75,6 +79,8 @@ struct RawKeyBindings {
     split_horizontal: Option<String>,
     copy: Option<String>,
     paste: Option<String>,
+    reload_config: Option<String>,
+    show_keybindings: Option<String>,
     focus_left: Option<String>,
     focus_right: Option<String>,
     focus_up: Option<String>,
@@ -99,6 +105,7 @@ impl Config {
             font_size: 12,
             shell: default_shell,
             tab_title: "Terminal".to_string(),
+            tab_bar_position: gtk::PositionType::Top,
             theme_file: None,
             keybindings: default_keybindings(),
         };
@@ -120,6 +127,11 @@ impl Config {
                     }
                     if let Some(tab_title) = raw.tab_title {
                         config.tab_title = tab_title;
+                    }
+                    if let Some(position) = raw.tab_bar_position {
+                        if let Some(parsed) = parse_tab_bar_position(&position) {
+                            config.tab_bar_position = parsed;
+                        }
                     }
                     if let Some(theme_file) = raw.theme_file {
                         config.theme_file = resolve_theme_path(&path, &theme_file);
@@ -161,27 +173,32 @@ fn main() {
 }
 
 fn build_ui(app: &gtk::Application, args: &CliArgs) {
-    let config = Rc::new(Config::load());
+    let config = Rc::new(RefCell::new(Config::load()));
     let tab_counter = Rc::new(Cell::new(1));
 
-    let config = if let Some(path) = args.theme_file.as_ref() {
-        let mut updated = (*config).clone();
-        updated.theme_file = Some(path.clone());
-        Rc::new(updated)
-    } else {
-        config
-    };
+    if let Some(path) = args.theme_file.as_ref() {
+        config.borrow_mut().theme_file = Some(path.clone());
+    }
 
     let window = gtk::ApplicationWindow::new(app);
     window.set_title(Some("Termilyon"));
     window.set_default_size(1000, 700);
+    window.set_decorated(false);
 
     let notebook = gtk::Notebook::new();
     notebook.set_hexpand(true);
     notebook.set_vexpand(true);
+    notebook.add_css_class("terminal-tabs");
+    notebook.set_tab_pos(config.borrow().tab_bar_position);
     window.set_child(Some(&notebook));
 
-    create_tab(&notebook, &config, &tab_counter);
+    let theme = config
+        .borrow()
+        .theme_file
+        .as_ref()
+        .and_then(|path| theme_from_file(path));
+    let first_terminal = create_tab(&notebook, &config, &tab_counter);
+    apply_tab_styles(&notebook, theme.as_ref(), Some(&first_terminal));
 
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -189,29 +206,31 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
     let config_clone = config.clone();
     let counter_clone = tab_counter.clone();
     let window_clone = window.clone();
+    let theme_override = args.theme_file.clone();
     controller.connect_key_pressed(move |_, key, _, state| {
-        if config_clone.keybindings.new_tab.matches(key, state) {
+        if config_clone.borrow().keybindings.new_tab.matches(key, state) {
             create_tab(&notebook_clone, &config_clone, &counter_clone);
             return gtk::glib::Propagation::Stop;
         }
 
-        if config_clone.keybindings.close_tab.matches(key, state) {
+        if config_clone.borrow().keybindings.close_tab.matches(key, state) {
             close_current_tab(&notebook_clone, &config_clone, &counter_clone);
             return gtk::glib::Propagation::Stop;
         }
 
-        if config_clone.keybindings.rename_tab.matches(key, state) {
+        if config_clone.borrow().keybindings.rename_tab.matches(key, state) {
             rename_current_tab(&window_clone, &notebook_clone);
             return gtk::glib::Propagation::Stop;
         }
 
-        if config_clone.keybindings.close_panel.matches(key, state) {
+        if config_clone.borrow().keybindings.close_panel.matches(key, state) {
             if close_focused_panel(window_clone.upcast_ref(), &notebook_clone) {
                 return gtk::glib::Propagation::Stop;
             }
         }
 
         if config_clone
+            .borrow()
             .keybindings
             .split_vertical
             .matches(key, state)
@@ -221,6 +240,7 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         }
 
         if config_clone
+            .borrow()
             .keybindings
             .split_horizontal
             .matches(key, state)
@@ -229,45 +249,76 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             return gtk::glib::Propagation::Stop;
         }
 
-        if config_clone.keybindings.copy.matches(key, state) {
+        if config_clone.borrow().keybindings.copy.matches(key, state) {
             if let Some(terminal) = focused_terminal(window_clone.upcast_ref()) {
                 terminal.copy_clipboard_format(Format::Text);
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        if config_clone.keybindings.paste.matches(key, state) {
+        if config_clone.borrow().keybindings.paste.matches(key, state) {
             if let Some(terminal) = focused_terminal(window_clone.upcast_ref()) {
                 terminal.paste_clipboard();
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        if config_clone.keybindings.focus_left.matches(key, state) {
+        if config_clone.borrow().keybindings.focus_left.matches(key, state) {
             if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Left) {
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        if config_clone.keybindings.focus_right.matches(key, state) {
+        if config_clone.borrow().keybindings.focus_right.matches(key, state) {
             if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Right) {
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        if config_clone.keybindings.focus_up.matches(key, state) {
+        if config_clone.borrow().keybindings.focus_up.matches(key, state) {
             if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Up) {
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        if config_clone.keybindings.focus_down.matches(key, state) {
+        if config_clone.borrow().keybindings.focus_down.matches(key, state) {
             if focus_adjacent_split(window_clone.upcast_ref(), FocusDirection::Down) {
                 return gtk::glib::Propagation::Stop;
             }
         }
 
-        for (index, binding) in config_clone.keybindings.tab_switch.iter().enumerate() {
+        if config_clone
+            .borrow()
+            .keybindings
+            .reload_config
+            .matches(key, state)
+        {
+            reload_config_and_theme(
+                &config_clone,
+                &notebook_clone,
+                theme_override.as_ref(),
+            );
+            return gtk::glib::Propagation::Stop;
+        }
+
+        if config_clone
+            .borrow()
+            .keybindings
+            .show_keybindings
+            .matches(key, state)
+        {
+            let config_ref = config_clone.borrow();
+            show_keybindings_dialog(&window_clone, &config_ref);
+            return gtk::glib::Propagation::Stop;
+        }
+
+        for (index, binding) in config_clone
+            .borrow()
+            .keybindings
+            .tab_switch
+            .iter()
+            .enumerate()
+        {
             if binding.matches(key, state) {
                 let target = index as u32;
                 if target < notebook_clone.n_pages() {
@@ -285,8 +336,13 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
     window.present();
 }
 
-fn create_tab(notebook: &gtk::Notebook, config: &Rc<Config>, counter: &Rc<Cell<u32>>) {
-    let terminal_widget = create_terminal_widget(config);
+fn create_tab(
+    notebook: &gtk::Notebook,
+    config: &Rc<RefCell<Config>>,
+    counter: &Rc<Cell<u32>>,
+) -> Terminal {
+    let config_ref = config.borrow();
+    let terminal_widget = create_terminal_widget(&config_ref);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
@@ -294,9 +350,11 @@ fn create_tab(notebook: &gtk::Notebook, config: &Rc<Config>, counter: &Rc<Cell<u
 
     let tab_index = counter.get();
     counter.set(tab_index + 1);
-    let label_text = format!("{} {}", config.tab_title, tab_index);
+    let label_text = format!("{} {}", config_ref.tab_title, tab_index);
     let label = gtk::Label::new(Some(&label_text));
+    label.add_css_class("terminal-tab-label");
     let tab_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    tab_box.add_css_class("terminal-tab");
     tab_box.append(&label);
 
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
@@ -308,8 +366,10 @@ fn create_tab(notebook: &gtk::Notebook, config: &Rc<Config>, counter: &Rc<Cell<u
     let config_clone = Rc::clone(config);
     let counter_clone = Rc::clone(counter);
     close_button.connect_clicked(move |_| {
-        if let Some(page) = notebook_clone.page_num(&content_clone) {
+        let page = notebook_clone.page_num(&content_clone);
+        if let Some(page) = page {
             notebook_clone.remove_page(Some(page));
+            focus_previous_tab(&notebook_clone, page);
         }
 
         if notebook_clone.n_pages() == 0 {
@@ -322,11 +382,18 @@ fn create_tab(notebook: &gtk::Notebook, config: &Rc<Config>, counter: &Rc<Cell<u
     notebook.append_page(&content, Some(&tab_box));
     notebook.set_current_page(Some(tab_index - 1));
     terminal_widget.terminal.grab_focus();
+
+    terminal_widget.terminal.clone()
 }
 
-fn close_current_tab(notebook: &gtk::Notebook, config: &Rc<Config>, counter: &Rc<Cell<u32>>) {
+fn close_current_tab(
+    notebook: &gtk::Notebook,
+    config: &Rc<RefCell<Config>>,
+    counter: &Rc<Cell<u32>>,
+) {
     if let Some(page) = notebook.current_page() {
         notebook.remove_page(Some(page));
+        focus_previous_tab(notebook, page);
     }
 
     if notebook.n_pages() == 0 {
@@ -382,7 +449,7 @@ fn find_tab_label(tab_widget: &gtk::Widget) -> Option<gtk::Label> {
 
 fn split_current_tab(
     notebook: &gtk::Notebook,
-    config: &Rc<Config>,
+    config: &Rc<RefCell<Config>>,
     orientation: gtk::Orientation,
 ) {
     let Some(page) = notebook.current_page() else { return };
@@ -396,7 +463,8 @@ fn split_current_tab(
         .or_else(|| root_box.first_child());
     let Some(existing_child) = existing_child else { return };
 
-    let new_terminal = create_terminal_widget(config);
+    let config_ref = config.borrow();
+    let new_terminal = create_terminal_widget(&config_ref);
     let paned = gtk::Paned::new(orientation);
     paned.set_wide_handle(true);
     paned.set_hexpand(true);
@@ -659,6 +727,10 @@ struct Theme {
     foreground: gdk::RGBA,
     cursor: gdk::RGBA,
     palette: [gdk::RGBA; 16],
+    tab_active_bg: Option<gdk::RGBA>,
+    tab_active_fg: Option<gdk::RGBA>,
+    tab_inactive_bg: Option<gdk::RGBA>,
+    tab_inactive_fg: Option<gdk::RGBA>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,6 +739,10 @@ struct ThemeConfig {
     foreground: String,
     cursor: String,
     palette: Vec<String>,
+    tab_active_bg: Option<String>,
+    tab_active_fg: Option<String>,
+    tab_inactive_bg: Option<String>,
+    tab_inactive_fg: Option<String>,
 }
 
 fn apply_theme(terminal: &Terminal, theme: &Theme) {
@@ -695,6 +771,10 @@ fn theme_from_file(path: &PathBuf) -> Option<Theme> {
         foreground: rgba(&raw.foreground),
         cursor: rgba(&raw.cursor),
         palette,
+        tab_active_bg: raw.tab_active_bg.as_deref().map(rgba),
+        tab_active_fg: raw.tab_active_fg.as_deref().map(rgba),
+        tab_inactive_bg: raw.tab_inactive_bg.as_deref().map(rgba),
+        tab_inactive_fg: raw.tab_inactive_fg.as_deref().map(rgba),
     })
 }
 
@@ -710,6 +790,262 @@ fn rgba(hex: &str) -> gdk::RGBA {
         _ => (0, 0, 0),
     };
     gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+}
+
+fn apply_tab_styles(
+    notebook: &gtk::Notebook,
+    theme: Option<&Theme>,
+    terminal: Option<&Terminal>,
+) {
+    let background = terminal
+        .map(|terminal| terminal.color_background_for_draw())
+        .or_else(|| theme.map(|theme| theme.background.clone()));
+    let Some(background) = background else { return };
+
+    let base_fg = theme
+        .map(|theme| theme.foreground.clone())
+        .unwrap_or_else(|| contrast_text_color(&background));
+
+    let active_bg = theme
+        .and_then(|theme| theme.tab_active_bg.clone())
+        .unwrap_or_else(|| background.clone());
+    let inactive_bg = theme
+        .and_then(|theme| theme.tab_inactive_bg.clone())
+        .unwrap_or_else(|| adjust_luma(&background, 0.92));
+
+    let active_fg = theme
+        .and_then(|theme| theme.tab_active_fg.clone())
+        .unwrap_or_else(|| base_fg.clone());
+    let inactive_fg = theme
+        .and_then(|theme| theme.tab_inactive_fg.clone())
+        .unwrap_or_else(|| with_alpha(&base_fg, 0.7));
+
+    let mut css = format!(
+        ".terminal-tabs > header {{ background-color: {}; }}",
+        background.to_str()
+    );
+    css.push_str(&format!(
+        ".terminal-tabs tab {{ background-color: {}; background-image: none; border-image: none; }}",
+        inactive_bg.to_str()
+    ));
+    css.push_str(&format!(
+        ".terminal-tabs tab:checked {{ background-color: {}; background-image: none; border-image: none; }}",
+        active_bg.to_str()
+    ));
+    css.push_str(".terminal-tabs tab > * { background-color: transparent; }");
+    css.push_str(&format!(
+        ".terminal-tabs tab label, .terminal-tabs tab button {{ color: {}; }}",
+        inactive_fg.to_str()
+    ));
+    css.push_str(&format!(
+        ".terminal-tabs tab:checked label, .terminal-tabs tab:checked button {{ color: {}; }}",
+        active_fg.to_str()
+    ));
+
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(&css);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    notebook.queue_draw();
+}
+
+fn reload_config_and_theme(
+    config: &Rc<RefCell<Config>>,
+    notebook: &gtk::Notebook,
+    theme_override: Option<&PathBuf>,
+) {
+    let mut updated = Config::load();
+    if let Some(path) = theme_override {
+        updated.theme_file = Some(path.clone());
+    }
+    let theme = updated
+        .theme_file
+        .as_ref()
+        .and_then(|path| theme_from_file(path));
+    *config.borrow_mut() = updated.clone();
+
+    notebook.set_tab_pos(updated.tab_bar_position);
+    let sample_terminal = find_first_terminal_in_notebook(notebook);
+    apply_tab_styles(notebook, theme.as_ref(), sample_terminal.as_ref());
+    apply_config_to_terminals(notebook, &updated, theme.as_ref());
+}
+
+fn find_first_terminal_in_notebook(notebook: &gtk::Notebook) -> Option<Terminal> {
+    for index in 0..notebook.n_pages() {
+        let Some(page) = notebook.nth_page(Some(index)) else { continue };
+        if let Some(terminal) = find_terminal_in_widget(&page) {
+            return Some(terminal);
+        }
+    }
+    None
+}
+
+fn apply_config_to_terminals(
+    notebook: &gtk::Notebook,
+    config: &Config,
+    theme: Option<&Theme>,
+) {
+    for index in 0..notebook.n_pages() {
+        let Some(page) = notebook.nth_page(Some(index)) else { continue };
+        let mut terminals = Vec::new();
+        collect_terminals(&page, &mut terminals);
+        for terminal in terminals {
+            terminal.set_scrollback_lines(config.scrollback_lines.into());
+            let mut font_desc = gtk::pango::FontDescription::from_string(&config.font);
+            if config.font_size > 0 {
+                font_desc.set_size(config.font_size * gtk::pango::SCALE);
+            }
+            terminal.set_font(Some(&font_desc));
+            if let Some(theme) = theme {
+                apply_theme(&terminal, theme);
+            }
+        }
+    }
+}
+
+fn collect_terminals(widget: &gtk::Widget, terminals: &mut Vec<Terminal>) {
+    if let Ok(terminal) = widget.clone().downcast::<Terminal>() {
+        terminals.push(terminal);
+        return;
+    }
+    if let Ok(scrolled) = widget.clone().downcast::<gtk::ScrolledWindow>() {
+        if let Some(child) = scrolled.child() {
+            collect_terminals(&child, terminals);
+        }
+        return;
+    }
+    if let Ok(paned) = widget.clone().downcast::<gtk::Paned>() {
+        if let Some(child) = paned.start_child() {
+            collect_terminals(&child, terminals);
+        }
+        if let Some(child) = paned.end_child() {
+            collect_terminals(&child, terminals);
+        }
+        return;
+    }
+
+    let mut child = widget.first_child();
+    while let Some(node) = child {
+        collect_terminals(&node, terminals);
+        child = node.next_sibling();
+    }
+}
+
+fn show_keybindings_dialog(window: &gtk::ApplicationWindow, config: &Config) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Keybindings"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(window));
+    dialog.add_button("Close", gtk::ResponseType::Close);
+
+    let content = dialog.content_area();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    list.set_margin_top(12);
+    list.set_margin_bottom(12);
+    list.set_margin_start(12);
+    list.set_margin_end(12);
+
+    add_keybinding_row(&list, "New tab", &config.keybindings.new_tab);
+    add_keybinding_row(&list, "Close tab", &config.keybindings.close_tab);
+    add_keybinding_row(&list, "Rename tab", &config.keybindings.rename_tab);
+    add_keybinding_row(&list, "Close panel", &config.keybindings.close_panel);
+    add_keybinding_row(&list, "Split vertical", &config.keybindings.split_vertical);
+    add_keybinding_row(&list, "Split horizontal", &config.keybindings.split_horizontal);
+    add_keybinding_row(&list, "Copy", &config.keybindings.copy);
+    add_keybinding_row(&list, "Paste", &config.keybindings.paste);
+    add_keybinding_row(&list, "Reload config/theme", &config.keybindings.reload_config);
+    add_keybinding_row(&list, "Show keybindings", &config.keybindings.show_keybindings);
+    add_keybinding_row(&list, "Focus left", &config.keybindings.focus_left);
+    add_keybinding_row(&list, "Focus right", &config.keybindings.focus_right);
+    add_keybinding_row(&list, "Focus up", &config.keybindings.focus_up);
+    add_keybinding_row(&list, "Focus down", &config.keybindings.focus_down);
+
+    for (index, binding) in config.keybindings.tab_switch.iter().enumerate() {
+        let title = format!("Switch tab {}", index + 1);
+        add_keybinding_row(&list, &title, binding);
+    }
+
+    content.append(&list);
+
+    dialog.connect_response(|dialog, _| {
+        dialog.close();
+    });
+    dialog.present();
+}
+
+fn add_keybinding_row(container: &gtk::Box, name: &str, binding: &KeyBinding) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let label = gtk::Label::new(Some(name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    let shortcut = gtk::Label::new(Some(&format_keybinding(binding)));
+    shortcut.set_xalign(1.0);
+    row.append(&label);
+    row.append(&shortcut);
+    container.append(&row);
+}
+
+fn format_keybinding(binding: &KeyBinding) -> String {
+    let mut parts = Vec::new();
+    let modifiers = binding.modifiers;
+    if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+        parts.push("Shift".to_string());
+    }
+    if modifiers.contains(gdk::ModifierType::ALT_MASK) {
+        parts.push("Alt".to_string());
+    }
+    if modifiers.contains(gdk::ModifierType::SUPER_MASK) {
+        parts.push("Super".to_string());
+    }
+
+    let key_name = binding
+        .key
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| format!("{:?}", binding.key));
+    let key_display = if key_name.len() == 1 {
+        key_name.to_ascii_uppercase()
+    } else {
+        key_name
+    };
+    parts.push(key_display);
+    parts.join("+")
+}
+
+fn clamp01(value: f32) -> f32 {
+    value.max(0.0).min(1.0)
+}
+
+fn adjust_luma(color: &gdk::RGBA, factor: f32) -> gdk::RGBA {
+    gdk::RGBA::new(
+        clamp01(color.red() * factor),
+        clamp01(color.green() * factor),
+        clamp01(color.blue() * factor),
+        color.alpha(),
+    )
+}
+
+fn with_alpha(color: &gdk::RGBA, alpha: f32) -> gdk::RGBA {
+    gdk::RGBA::new(color.red(), color.green(), color.blue(), clamp01(alpha))
+}
+
+fn contrast_text_color(background: &gdk::RGBA) -> gdk::RGBA {
+    let luminance = 0.2126 * background.red()
+        + 0.7152 * background.green()
+        + 0.0722 * background.blue();
+    if luminance < 0.5 {
+        gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
+    } else {
+        gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)
+    }
 }
 
 fn parse_palette(values: &[String]) -> Option<[gdk::RGBA; 16]> {
@@ -743,6 +1079,7 @@ fn close_tab_or_window(window: &gtk::Window, notebook: &gtk::Notebook) {
             window.close();
         } else {
             notebook.remove_page(Some(page));
+            focus_previous_tab(notebook, page);
         }
     }
 }
@@ -757,6 +1094,8 @@ fn default_keybindings() -> KeyBindings {
         split_horizontal: parse_keybinding("Ctrl+Shift+H").unwrap(),
         copy: parse_keybinding("Ctrl+Shift+C").unwrap(),
         paste: parse_keybinding("Ctrl+Shift+V").unwrap(),
+        reload_config: parse_keybinding("Ctrl+Shift+L").unwrap(),
+        show_keybindings: parse_keybinding("Ctrl+Shift+K").unwrap(),
         focus_left: parse_keybinding("Alt+Left").unwrap(),
         focus_right: parse_keybinding("Alt+Right").unwrap(),
         focus_up: parse_keybinding("Alt+Up").unwrap(),
@@ -791,6 +1130,12 @@ fn apply_keybindings(bindings: &mut KeyBindings, raw: RawKeyBindings) {
     }
     if let Some(value) = raw.paste.and_then(|s| parse_keybinding(&s)) {
         bindings.paste = value;
+    }
+    if let Some(value) = raw.reload_config.and_then(|s| parse_keybinding(&s)) {
+        bindings.reload_config = value;
+    }
+    if let Some(value) = raw.show_keybindings.and_then(|s| parse_keybinding(&s)) {
+        bindings.show_keybindings = value;
     }
     if let Some(value) = raw.focus_left.and_then(|s| parse_keybinding(&s)) {
         bindings.focus_left = value;
@@ -854,5 +1199,30 @@ impl KeyBinding {
             || key.to_lower() == self.key.to_lower()
             || key.to_upper() == self.key.to_upper();
         key_matches && state & relevant == self.modifiers
+    }
+}
+
+fn parse_tab_bar_position(value: &str) -> Option<gtk::PositionType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "top" => Some(gtk::PositionType::Top),
+        "bottom" => Some(gtk::PositionType::Bottom),
+        _ => None,
+    }
+}
+
+fn focus_previous_tab(notebook: &gtk::Notebook, closed_index: u32) {
+    let pages = notebook.n_pages();
+    if pages == 0 {
+        return;
+    }
+    let mut target = if closed_index > 0 { closed_index - 1 } else { 0 };
+    if target >= pages {
+        target = pages - 1;
+    }
+    notebook.set_current_page(Some(target));
+    if let Some(page) = notebook.nth_page(Some(target)) {
+        if let Some(terminal) = find_terminal_in_widget(&page) {
+            terminal.grab_focus();
+        }
     }
 }

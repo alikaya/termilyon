@@ -42,6 +42,7 @@ font = "Fira Code 12"
 font_size = 12
 shell = "/bin/bash"
 tab_title = "Terminal"
+tab_bar_position = "top"
 theme_file = "themes/catppuccin-mocha.toml"
 
 [keybindings]
@@ -53,6 +54,8 @@ split_vertical = "Ctrl+Shift+P"
 split_horizontal = "Ctrl+Shift+H"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
+reload_config = "Ctrl+Shift+L"
+show_keybindings = "Ctrl+Shift+K"
 focus_left = "Alt+Left"
 focus_right = "Alt+Right"
 focus_up = "Alt+Up"
@@ -110,6 +113,15 @@ palette = [
 ]
 ```
 
+Optional tab colors:
+
+```toml
+tab_active_bg = "#1e1e2e"
+tab_active_fg = "#cdd6f4"
+tab_inactive_bg = "#181825"
+tab_inactive_fg = "#a6adc8"
+```
+
 ## CLI
 
 Override theme file for this run:
@@ -128,6 +140,8 @@ Defaults (all can be changed via config):
 - `Ctrl+D`: close focused panel (close tab/window if last)
 - `Ctrl+Shift+V`: split vertical (left/right)
 - `Ctrl+Shift+H`: split horizontal (top/bottom)
+- `Ctrl+Shift+L`: reload config/theme
+- `Ctrl+Shift+K`: show keybindings
 - `Alt+Left/Right/Up/Down`: move focus between splits
 - `Alt+1..9`: switch tab
 
