@@ -190,6 +190,9 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
     notebook.set_vexpand(true);
     notebook.add_css_class("terminal-tabs");
     notebook.set_tab_pos(config.borrow().tab_bar_position);
+    notebook.connect_switch_page(|notebook, _, page| {
+        focus_terminal_in_page(notebook, page);
+    });
     window.set_child(Some(&notebook));
 
     let theme = config
@@ -323,6 +326,7 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
                 let target = index as u32;
                 if target < notebook_clone.n_pages() {
                     notebook_clone.set_current_page(Some(target));
+                    focus_terminal_in_page(&notebook_clone, target);
                     return gtk::glib::Propagation::Stop;
                 }
                 break;
@@ -1220,8 +1224,12 @@ fn focus_previous_tab(notebook: &gtk::Notebook, closed_index: u32) {
         target = pages - 1;
     }
     notebook.set_current_page(Some(target));
-    if let Some(page) = notebook.nth_page(Some(target)) {
-        if let Some(terminal) = find_terminal_in_widget(&page) {
+    focus_terminal_in_page(notebook, target);
+}
+
+fn focus_terminal_in_page(notebook: &gtk::Notebook, page: u32) {
+    if let Some(child) = notebook.nth_page(Some(page)) {
+        if let Some(terminal) = find_terminal_in_widget(&child) {
             terminal.grab_focus();
         }
     }
