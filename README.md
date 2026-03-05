@@ -142,6 +142,8 @@ Defaults (all can be changed via config):
 - `Ctrl+Shift+H`: split horizontal (top/bottom)
 - `Ctrl+Shift+L`: reload config/theme
 - `Ctrl+Shift+K`: show keybindings
+- `Ctrl+Shift+S`: SSH server manager (add/delete/connect)
+- `Ctrl+Shift+A`: Password manager (add/delete/paste)
 - `Alt+Left/Right/Up/Down`: move focus between splits
 - `Alt+1..9`: switch tab
 
