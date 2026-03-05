@@ -1,4 +1,5 @@
 scrollback_lines = 10000
+secret = "buraya-gizli-anahtarinizi-yazin"
 font = "Fira Code 12"
 font_size = 12
 shell = "/bin/bash"
@@ -17,6 +18,8 @@ copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
 reload_config = "Ctrl+Shift+L"
 show_keybindings = "Ctrl+Shift+K"
+ssh_manager = "Ctrl+Shift+S"
+password_manager = "Ctrl+Shift+A"
 focus_left = "Alt+Left"
 focus_right = "Alt+Right"
 focus_up = "Alt+Up"

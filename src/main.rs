@@ -9,9 +9,33 @@ use directories::ProjectDirs;
 use gtk4 as gtk;
 use gtk::gdk;
 use gtk::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use vte4::prelude::*;
 use vte4::{Format, PtyFlags, Terminal};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SshServer {
+    name: String,
+    host: String,
+    user: String,
+    port: u16,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SshServers {
+    servers: Vec<SshServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Password {
+    name: String,
+    password: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Passwords {
+    passwords: Vec<Password>,
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -23,6 +47,7 @@ struct Config {
     tab_bar_position: gtk::PositionType,
     theme_file: Option<PathBuf>,
     keybindings: KeyBindings,
+    secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +60,7 @@ struct RawConfig {
     tab_bar_position: Option<String>,
     theme_file: Option<String>,
     keybindings: Option<RawKeyBindings>,
+    secret: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -60,6 +86,8 @@ struct KeyBindings {
     focus_right: KeyBinding,
     focus_up: KeyBinding,
     focus_down: KeyBinding,
+    ssh_manager: KeyBinding,
+    password_manager: KeyBinding,
     tab_switch: Vec<KeyBinding>,
 }
 
@@ -85,6 +113,8 @@ struct RawKeyBindings {
     focus_right: Option<String>,
     focus_up: Option<String>,
     focus_down: Option<String>,
+    ssh_manager: Option<String>,
+    password_manager: Option<String>,
     tab_1: Option<String>,
     tab_2: Option<String>,
     tab_3: Option<String>,
@@ -108,6 +138,7 @@ impl Config {
             tab_bar_position: gtk::PositionType::Top,
             theme_file: None,
             keybindings: default_keybindings(),
+            secret: String::new(),
         };
 
         if let Some(path) = config_path() {
@@ -138,6 +169,9 @@ impl Config {
                     }
                     if let Some(raw_keys) = raw.keybindings {
                         apply_keybindings(&mut config.keybindings, raw_keys);
+                    }
+                    if let Some(secret) = raw.secret {
+                        config.secret = secret;
                     }
                 }
             }
@@ -227,9 +261,10 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         }
 
         if config_clone.borrow().keybindings.close_panel.matches(key, state) {
-            if close_focused_panel(window_clone.upcast_ref(), &notebook_clone) {
-                return gtk::glib::Propagation::Stop;
+            if let Some(terminal) = focused_terminal(window_clone.upcast_ref()) {
+                terminal.feed_child(b"\x04");
             }
+            return gtk::glib::Propagation::Stop;
         }
 
         if config_clone
@@ -312,6 +347,27 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         {
             let config_ref = config_clone.borrow();
             show_keybindings_dialog(&window_clone, &config_ref);
+            return gtk::glib::Propagation::Stop;
+        }
+
+        if config_clone
+            .borrow()
+            .keybindings
+            .ssh_manager
+            .matches(key, state)
+        {
+            show_ssh_manager_dialog(&window_clone, &notebook_clone);
+            return gtk::glib::Propagation::Stop;
+        }
+
+        if config_clone
+            .borrow()
+            .keybindings
+            .password_manager
+            .matches(key, state)
+        {
+            let secret = config_clone.borrow().secret.clone();
+            show_password_manager_dialog(&window_clone, &notebook_clone, secret);
             return gtk::glib::Propagation::Stop;
         }
 
@@ -964,6 +1020,8 @@ fn show_keybindings_dialog(window: &gtk::ApplicationWindow, config: &Config) {
     add_keybinding_row(&list, "Paste", &config.keybindings.paste);
     add_keybinding_row(&list, "Reload config/theme", &config.keybindings.reload_config);
     add_keybinding_row(&list, "Show keybindings", &config.keybindings.show_keybindings);
+    add_keybinding_row(&list, "SSH manager", &config.keybindings.ssh_manager);
+    add_keybinding_row(&list, "Password manager", &config.keybindings.password_manager);
     add_keybinding_row(&list, "Focus left", &config.keybindings.focus_left);
     add_keybinding_row(&list, "Focus right", &config.keybindings.focus_right);
     add_keybinding_row(&list, "Focus up", &config.keybindings.focus_up);
@@ -1077,6 +1135,813 @@ fn parse_palette(values: &[String]) -> Option<[gdk::RGBA; 16]> {
     ])
 }
 
+fn derive_key(secret: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    hasher.finalize().into()
+}
+
+fn encrypt_password(plaintext: &str, secret: &str) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let key_bytes = derive_key(secret);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    Ok(STANDARD.encode(&combined))
+}
+
+fn decrypt_password(encrypted: &str, secret: &str) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let data = STANDARD.decode(encrypted).map_err(|e| e.to_string())?;
+    if data.len() < 13 {
+        return Err("Geçersiz şifreli veri".to_string());
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let key_bytes = derive_key(secret);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "Şifre çözme başarısız — secret anahtarı yanlış olabilir".to_string())?;
+    String::from_utf8(plaintext).map_err(|e| e.to_string())
+}
+
+fn first_visible_index(list_box: &gtk::ListBox) -> Option<i32> {
+    let mut idx = 0;
+    loop {
+        match list_box.row_at_index(idx) {
+            None => return None,
+            Some(row) if row.is_visible() => return Some(idx),
+            _ => idx += 1,
+        }
+    }
+}
+
+fn select_first_visible(list_box: &gtk::ListBox) {
+    let mut idx = 0;
+    loop {
+        match list_box.row_at_index(idx) {
+            None => {
+                list_box.select_row(None::<&gtk::ListBoxRow>);
+                break;
+            }
+            Some(row) if row.is_visible() => {
+                list_box.select_row(Some(&row));
+                break;
+            }
+            _ => idx += 1,
+        }
+    }
+}
+
+fn passwords_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "termilyon")
+        .map(|dirs| dirs.config_dir().join("passwords.toml"))
+}
+
+fn load_passwords(secret: &str) -> Vec<Password> {
+    let Some(path) = passwords_path() else { return Vec::new() };
+    let Ok(content) = fs::read_to_string(&path) else { return Vec::new() };
+    let encrypted_list = toml::from_str::<Passwords>(&content)
+        .map(|p| p.passwords)
+        .unwrap_or_default();
+    encrypted_list
+        .into_iter()
+        .filter_map(|p| {
+            decrypt_password(&p.password, secret)
+                .ok()
+                .map(|plaintext| Password { name: p.name, password: plaintext })
+        })
+        .collect()
+}
+
+fn save_passwords(passwords: &[Password], secret: &str) {
+    let Some(path) = passwords_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let encrypted: Vec<Password> = passwords
+        .iter()
+        .filter_map(|p| {
+            encrypt_password(&p.password, secret)
+                .ok()
+                .map(|enc| Password { name: p.name.clone(), password: enc })
+        })
+        .collect();
+    let data = Passwords { passwords: encrypted };
+    if let Ok(content) = toml::to_string(&data) {
+        let _ = fs::write(&path, content);
+    }
+}
+
+fn populate_password_list(list_box: &gtk::ListBox, passwords: &[Password]) {
+    while let Some(row) = list_box.row_at_index(0) {
+        list_box.remove(&row);
+    }
+    for pwd in passwords {
+        let label = gtk::Label::new(Some(&pwd.name));
+        label.set_xalign(0.0);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        label.set_margin_start(8);
+        label.set_margin_end(8);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&label));
+        list_box.append(&row);
+    }
+    if let Some(first) = list_box.row_at_index(0) {
+        list_box.select_row(Some(&first));
+    }
+}
+
+fn password_paste_selected(
+    dialog: &gtk::Dialog,
+    notebook: &gtk::Notebook,
+    list_box: &gtk::ListBox,
+    passwords: &Rc<RefCell<Vec<Password>>>,
+) {
+    let Some(row) = list_box.selected_row() else { return };
+    let index = row.index() as usize;
+    let passwords_ref = passwords.borrow();
+    let Some(pwd) = passwords_ref.get(index) else { return };
+    let text = format!("{}\n", pwd.password);
+    let Some(page) = notebook.current_page() else { return };
+    let Some(child) = notebook.nth_page(Some(page)) else { return };
+    if let Some(terminal) = find_terminal_in_widget(&child) {
+        terminal.feed_child(text.as_bytes());
+    }
+    dialog.close();
+}
+
+fn show_add_password_dialog(
+    parent: &gtk::Dialog,
+    list_box: &gtk::ListBox,
+    passwords: &Rc<RefCell<Vec<Password>>>,
+    secret: Rc<String>,
+) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Add Password"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(parent));
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Add", gtk::ResponseType::Ok);
+    dialog.set_default_response(gtk::ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(8);
+
+    let name_label = gtk::Label::new(Some("Name:"));
+    name_label.set_xalign(1.0);
+    let name_entry = gtk::Entry::new();
+    name_entry.set_placeholder_text(Some("sudo, API key, ..."));
+    name_entry.set_activates_default(true);
+
+    let pass_label = gtk::Label::new(Some("Password:"));
+    pass_label.set_xalign(1.0);
+    let pass_entry = gtk::Entry::new();
+    pass_entry.set_visibility(false);
+    pass_entry.set_input_purpose(gtk::InputPurpose::Password);
+    pass_entry.set_activates_default(true);
+
+    grid.attach(&name_label, 0, 0, 1, 1);
+    grid.attach(&name_entry, 1, 0, 1, 1);
+    grid.attach(&pass_label, 0, 1, 1, 1);
+    grid.attach(&pass_entry, 1, 1, 1, 1);
+    content.append(&grid);
+
+    let list_box = list_box.clone();
+    let passwords = passwords.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Ok {
+            let name = name_entry.text().trim().to_string();
+            let password = pass_entry.text().to_string();
+            if !name.is_empty() && !password.is_empty() {
+                let entry = Password { name, password };
+                {
+                    let mut pwds = passwords.borrow_mut();
+                    pwds.push(entry);
+                    save_passwords(&pwds, &secret);
+                }
+                populate_password_list(&list_box, &passwords.borrow());
+            }
+        }
+        dialog.close();
+    });
+
+    dialog.present();
+}
+
+fn show_password_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Notebook, secret: String) {
+    if secret.is_empty() {
+        let dialog = gtk::Dialog::new();
+        dialog.set_title(Some("Şifre Yöneticisi"));
+        dialog.set_modal(true);
+        dialog.set_transient_for(Some(window));
+        dialog.add_button("Tamam", gtk::ResponseType::Ok);
+        let content = dialog.content_area();
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        let label = gtk::Label::new(Some(
+            "Şifre yöneticisini kullanmak için config.toml dosyasına\n\
+             secret = \"gizli-anahtarınız\" satırını ekleyin.",
+        ));
+        label.set_wrap(true);
+        content.append(&label);
+        dialog.connect_response(|d, _| d.close());
+        dialog.present();
+        return;
+    }
+
+    let secret = Rc::new(secret);
+    let passwords = Rc::new(RefCell::new(load_passwords(&secret)));
+
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Passwords"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(window));
+    dialog.set_default_size(400, 340);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Ara..."));
+    content.append(&search_entry);
+
+    let list_box = gtk::ListBox::new();
+    list_box.set_selection_mode(gtk::SelectionMode::Single);
+    list_box.set_vexpand(true);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_box));
+    scrolled.set_vexpand(true);
+    scrolled.set_min_content_height(200);
+    content.append(&scrolled);
+
+    populate_password_list(&list_box, &passwords.borrow());
+
+    // Filtre fonksiyonu
+    {
+        let search = search_entry.clone();
+        list_box.set_filter_func(move |row| {
+            let text = search.text().to_lowercase();
+            if text.is_empty() { return true; }
+            row.child()
+                .and_then(|c| c.downcast::<gtk::Label>().ok())
+                .is_some_and(|l| l.text().to_lowercase().contains(&text))
+        });
+    }
+
+    // Arama değiştiğinde filtrele ve ilk görünür satırı seç
+    {
+        let list_box = list_box.clone();
+        search_entry.connect_search_changed(move |_| {
+            list_box.invalidate_filter();
+            select_first_visible(&list_box);
+        });
+    }
+
+    // Arama kutusunda ↓ → listeye geç; Escape → kapat
+    {
+        let ctrl = gtk::EventControllerKey::new();
+        let list_box = list_box.clone();
+        let dialog = dialog.clone();
+        ctrl.connect_key_pressed(move |_, key, _, _| match key {
+            gdk::Key::Down => {
+                if let Some(row) = list_box.selected_row() {
+                    row.grab_focus();
+                } else {
+                    select_first_visible(&list_box);
+                    if let Some(row) = list_box.selected_row() {
+                        row.grab_focus();
+                    }
+                }
+                gtk::glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                dialog.close();
+                gtk::glib::Propagation::Stop
+            }
+            _ => gtk::glib::Propagation::Proceed,
+        });
+        search_entry.add_controller(ctrl);
+    }
+
+    // Listede ↑ + ilk satır → arama kutusuna dön
+    {
+        let ctrl = gtk::EventControllerKey::new();
+        ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let search = search_entry.clone();
+        let list_box_mv = list_box.clone();
+        let list_box_ac = list_box.clone();
+        ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Up {
+                if let Some(row) = list_box_mv.selected_row() {
+                    if Some(row.index()) == first_visible_index(&list_box_mv) {
+                        search.grab_focus();
+                        return gtk::glib::Propagation::Stop;
+                    }
+                }
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        list_box_ac.add_controller(ctrl);
+    }
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btn_box.set_margin_top(4);
+    btn_box.set_halign(gtk::Align::End);
+
+    let add_btn = gtk::Button::with_label("Add");
+    let delete_btn = gtk::Button::with_label("Delete");
+    let paste_btn = gtk::Button::with_label("Paste");
+    let close_btn = gtk::Button::with_label("Close");
+    btn_box.append(&add_btn);
+    btn_box.append(&delete_btn);
+    btn_box.append(&paste_btn);
+    btn_box.append(&close_btn);
+    content.append(&btn_box);
+
+    // Add button
+    {
+        let dialog = dialog.clone();
+        let list_box = list_box.clone();
+        let passwords = passwords.clone();
+        let secret = secret.clone();
+        add_btn.connect_clicked(move |_| {
+            show_add_password_dialog(&dialog, &list_box, &passwords, secret.clone());
+        });
+    }
+
+    // Delete button
+    {
+        let list_box = list_box.clone();
+        let passwords = passwords.clone();
+        let secret = secret.clone();
+        delete_btn.connect_clicked(move |_| {
+            let Some(row) = list_box.selected_row() else { return };
+            let index = row.index() as usize;
+            {
+                let mut pwds = passwords.borrow_mut();
+                if index < pwds.len() {
+                    pwds.remove(index);
+                }
+                save_passwords(&pwds, &secret);
+            }
+            populate_password_list(&list_box, &passwords.borrow());
+            list_box.invalidate_filter();
+            select_first_visible(&list_box);
+        });
+    }
+
+    // Paste button
+    {
+        let dialog = dialog.clone();
+        let notebook = notebook.clone();
+        let passwords = passwords.clone();
+        let list_box = list_box.clone();
+        paste_btn.connect_clicked(move |_| {
+            password_paste_selected(&dialog, &notebook, &list_box, &passwords);
+        });
+    }
+
+    // Close button
+    {
+        let dialog = dialog.clone();
+        close_btn.connect_clicked(move |_| dialog.close());
+    }
+
+    // Row activated: Enter or double-click → paste
+    {
+        let dialog = dialog.clone();
+        let notebook = notebook.clone();
+        let passwords = passwords.clone();
+        list_box.connect_row_activated(move |lb, _| {
+            password_paste_selected(&dialog, &notebook, lb, &passwords);
+        });
+    }
+
+    // Delete key removes selected entry
+    {
+        let key_ctrl = gtk::EventControllerKey::new();
+        let passwords = passwords.clone();
+        let list_box = list_box.clone();
+        let secret = secret.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Delete {
+                let Some(row) = list_box.selected_row() else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                let index = row.index() as usize;
+                {
+                    let mut pwds = passwords.borrow_mut();
+                    if index < pwds.len() {
+                        pwds.remove(index);
+                    }
+                    save_passwords(&pwds, &secret);
+                }
+                populate_password_list(&list_box, &passwords.borrow());
+                list_box.invalidate_filter();
+                select_first_visible(&list_box);
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_ctrl);
+    }
+
+    search_entry.grab_focus();
+    dialog.present();
+}
+
+fn ssh_servers_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "termilyon")
+        .map(|dirs| dirs.config_dir().join("ssh_servers.toml"))
+}
+
+fn load_ssh_servers() -> Vec<SshServer> {
+    let Some(path) = ssh_servers_path() else { return Vec::new() };
+    let Ok(content) = fs::read_to_string(&path) else { return Vec::new() };
+    toml::from_str::<SshServers>(&content)
+        .map(|s| s.servers)
+        .unwrap_or_default()
+}
+
+fn save_ssh_servers(servers: &[SshServer]) {
+    let Some(path) = ssh_servers_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let data = SshServers { servers: servers.to_vec() };
+    if let Ok(content) = toml::to_string(&data) {
+        let _ = fs::write(&path, content);
+    }
+}
+
+fn populate_server_list(list_box: &gtk::ListBox, servers: &[SshServer]) {
+    while let Some(row) = list_box.row_at_index(0) {
+        list_box.remove(&row);
+    }
+    for srv in servers {
+        let text = if srv.port == 22 {
+            format!("{}  —  {}@{}", srv.name, srv.user, srv.host)
+        } else {
+            format!("{}  —  {}@{}:{}", srv.name, srv.user, srv.host, srv.port)
+        };
+        let label = gtk::Label::new(Some(&text));
+        label.set_xalign(0.0);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        label.set_margin_start(8);
+        label.set_margin_end(8);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&label));
+        list_box.append(&row);
+    }
+    if let Some(first) = list_box.row_at_index(0) {
+        list_box.select_row(Some(&first));
+    }
+}
+
+fn ssh_connect_selected(
+    dialog: &gtk::Dialog,
+    notebook: &gtk::Notebook,
+    list_box: &gtk::ListBox,
+    servers: &Rc<RefCell<Vec<SshServer>>>,
+) {
+    let Some(row) = list_box.selected_row() else { return };
+    let index = row.index() as usize;
+    let servers_ref = servers.borrow();
+    let Some(srv) = servers_ref.get(index) else { return };
+    let cmd = if srv.port == 22 {
+        format!("ssh {}@{}\n", srv.user, srv.host)
+    } else {
+        format!("ssh -p {} {}@{}\n", srv.port, srv.user, srv.host)
+    };
+    let Some(page) = notebook.current_page() else { return };
+    let Some(child) = notebook.nth_page(Some(page)) else { return };
+    if let Some(terminal) = find_terminal_in_widget(&child) {
+        terminal.feed_child(cmd.as_bytes());
+    }
+    dialog.close();
+}
+
+fn show_add_server_dialog(
+    parent: &gtk::Dialog,
+    list_box: &gtk::ListBox,
+    servers: &Rc<RefCell<Vec<SshServer>>>,
+) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Add SSH Server"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(parent));
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Add", gtk::ResponseType::Ok);
+    dialog.set_default_response(gtk::ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(8);
+
+    let make_label = |text: &str| {
+        let l = gtk::Label::new(Some(text));
+        l.set_xalign(1.0);
+        l
+    };
+    let make_entry = |placeholder: &str, default: &str| {
+        let e = gtk::Entry::new();
+        e.set_placeholder_text(Some(placeholder));
+        if !default.is_empty() {
+            e.set_text(default);
+        }
+        e.set_activates_default(true);
+        e
+    };
+
+    let name_entry = make_entry("My Server", "");
+    let host_entry = make_entry("192.168.1.1", "");
+    let user_entry = make_entry("root", "");
+    let port_entry = make_entry("22", "22");
+
+    grid.attach(&make_label("Name:"), 0, 0, 1, 1);
+    grid.attach(&name_entry, 1, 0, 1, 1);
+    grid.attach(&make_label("Host:"), 0, 1, 1, 1);
+    grid.attach(&host_entry, 1, 1, 1, 1);
+    grid.attach(&make_label("User:"), 0, 2, 1, 1);
+    grid.attach(&user_entry, 1, 2, 1, 1);
+    grid.attach(&make_label("Port:"), 0, 3, 1, 1);
+    grid.attach(&port_entry, 1, 3, 1, 1);
+
+    content.append(&grid);
+
+    let list_box = list_box.clone();
+    let servers = servers.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Ok {
+            let name = name_entry.text().trim().to_string();
+            let host = host_entry.text().trim().to_string();
+            let user = user_entry.text().trim().to_string();
+            let port: u16 = port_entry.text().trim().parse().unwrap_or(22);
+            if !name.is_empty() && !host.is_empty() && !user.is_empty() {
+                let srv = SshServer { name, host, user, port };
+                {
+                    let mut svs = servers.borrow_mut();
+                    svs.push(srv);
+                    save_ssh_servers(&svs);
+                }
+                populate_server_list(&list_box, &servers.borrow());
+            }
+        }
+        dialog.close();
+    });
+
+    dialog.present();
+}
+
+fn show_ssh_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Notebook) {
+    let servers = Rc::new(RefCell::new(load_ssh_servers()));
+
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("SSH Servers"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(window));
+    dialog.set_default_size(520, 360);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Ara..."));
+    content.append(&search_entry);
+
+    let list_box = gtk::ListBox::new();
+    list_box.set_selection_mode(gtk::SelectionMode::Single);
+    list_box.set_vexpand(true);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_box));
+    scrolled.set_vexpand(true);
+    scrolled.set_min_content_height(220);
+    content.append(&scrolled);
+
+    populate_server_list(&list_box, &servers.borrow());
+
+    // Filtre fonksiyonu
+    {
+        let search = search_entry.clone();
+        list_box.set_filter_func(move |row| {
+            let text = search.text().to_lowercase();
+            if text.is_empty() { return true; }
+            row.child()
+                .and_then(|c| c.downcast::<gtk::Label>().ok())
+                .is_some_and(|l| l.text().to_lowercase().contains(&text))
+        });
+    }
+
+    // Arama değiştiğinde filtrele ve ilk görünür satırı seç
+    {
+        let list_box = list_box.clone();
+        search_entry.connect_search_changed(move |_| {
+            list_box.invalidate_filter();
+            select_first_visible(&list_box);
+        });
+    }
+
+    // Arama kutusunda ↓ → listeye geç; Escape → dialog'u kapat
+    {
+        let ctrl = gtk::EventControllerKey::new();
+        let list_box = list_box.clone();
+        let dialog = dialog.clone();
+        ctrl.connect_key_pressed(move |_, key, _, _| match key {
+            gdk::Key::Down => {
+                if let Some(row) = list_box.selected_row() {
+                    row.grab_focus();
+                } else {
+                    select_first_visible(&list_box);
+                    if let Some(row) = list_box.selected_row() {
+                        row.grab_focus();
+                    }
+                }
+                gtk::glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                dialog.close();
+                gtk::glib::Propagation::Stop
+            }
+            _ => gtk::glib::Propagation::Proceed,
+        });
+        search_entry.add_controller(ctrl);
+    }
+
+    // Listede ↑ + ilk satır → arama kutusuna dön
+    {
+        let ctrl = gtk::EventControllerKey::new();
+        ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let search = search_entry.clone();
+        let list_box_mv = list_box.clone();
+        let list_box_ac = list_box.clone();
+        ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Up {
+                if let Some(row) = list_box_mv.selected_row() {
+                    if Some(row.index()) == first_visible_index(&list_box_mv) {
+                        search.grab_focus();
+                        return gtk::glib::Propagation::Stop;
+                    }
+                }
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        list_box_ac.add_controller(ctrl);
+    }
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btn_box.set_margin_top(4);
+    btn_box.set_halign(gtk::Align::End);
+
+    let add_btn = gtk::Button::with_label("Add");
+    let delete_btn = gtk::Button::with_label("Delete");
+    let connect_btn = gtk::Button::with_label("Connect");
+    let close_btn = gtk::Button::with_label("Close");
+    btn_box.append(&add_btn);
+    btn_box.append(&delete_btn);
+    btn_box.append(&connect_btn);
+    btn_box.append(&close_btn);
+    content.append(&btn_box);
+
+    // Add button
+    {
+        let dialog = dialog.clone();
+        let list_box = list_box.clone();
+        let servers = servers.clone();
+        add_btn.connect_clicked(move |_| {
+            show_add_server_dialog(&dialog, &list_box, &servers);
+        });
+    }
+
+    // Delete button
+    {
+        let list_box = list_box.clone();
+        let servers = servers.clone();
+        delete_btn.connect_clicked(move |_| {
+            let Some(row) = list_box.selected_row() else { return };
+            let index = row.index() as usize;
+            {
+                let mut svs = servers.borrow_mut();
+                if index < svs.len() {
+                    svs.remove(index);
+                }
+                save_ssh_servers(&svs);
+            }
+            populate_server_list(&list_box, &servers.borrow());
+            list_box.invalidate_filter();
+            select_first_visible(&list_box);
+        });
+    }
+
+    // Connect button
+    {
+        let dialog = dialog.clone();
+        let notebook = notebook.clone();
+        let servers = servers.clone();
+        let list_box = list_box.clone();
+        connect_btn.connect_clicked(move |_| {
+            ssh_connect_selected(&dialog, &notebook, &list_box, &servers);
+        });
+    }
+
+    // Close button
+    {
+        let dialog = dialog.clone();
+        close_btn.connect_clicked(move |_| dialog.close());
+    }
+
+    // Row activated: Enter key or double-click
+    {
+        let dialog = dialog.clone();
+        let notebook = notebook.clone();
+        let servers = servers.clone();
+        list_box.connect_row_activated(move |lb, _| {
+            ssh_connect_selected(&dialog, &notebook, lb, &servers);
+        });
+    }
+
+    // Delete tuşu seçili sunucuyu siler
+    {
+        let key_ctrl = gtk::EventControllerKey::new();
+        let servers = servers.clone();
+        let list_box = list_box.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Delete {
+                let Some(row) = list_box.selected_row() else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                let index = row.index() as usize;
+                {
+                    let mut svs = servers.borrow_mut();
+                    if index < svs.len() {
+                        svs.remove(index);
+                    }
+                    save_ssh_servers(&svs);
+                }
+                populate_server_list(&list_box, &servers.borrow());
+                list_box.invalidate_filter();
+                select_first_visible(&list_box);
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_ctrl);
+    }
+
+    search_entry.grab_focus();
+    dialog.present();
+}
+
 fn close_tab_or_window(window: &gtk::Window, notebook: &gtk::Notebook) {
     if let Some(page) = notebook.current_page() {
         if notebook.n_pages() <= 1 {
@@ -1104,6 +1969,8 @@ fn default_keybindings() -> KeyBindings {
         focus_right: parse_keybinding("Alt+Right").unwrap(),
         focus_up: parse_keybinding("Alt+Up").unwrap(),
         focus_down: parse_keybinding("Alt+Down").unwrap(),
+        ssh_manager: parse_keybinding("Ctrl+Shift+S").unwrap(),
+        password_manager: parse_keybinding("Ctrl+Shift+A").unwrap(),
         tab_switch: (1..=9)
             .map(|n| parse_keybinding(&format!("Alt+{n}")).unwrap())
             .collect(),
@@ -1152,6 +2019,12 @@ fn apply_keybindings(bindings: &mut KeyBindings, raw: RawKeyBindings) {
     }
     if let Some(value) = raw.focus_down.and_then(|s| parse_keybinding(&s)) {
         bindings.focus_down = value;
+    }
+    if let Some(value) = raw.ssh_manager.and_then(|s| parse_keybinding(&s)) {
+        bindings.ssh_manager = value;
+    }
+    if let Some(value) = raw.password_manager.and_then(|s| parse_keybinding(&s)) {
+        bindings.password_manager = value;
     }
 
     let tabs = [
