@@ -442,6 +442,7 @@ fn create_tab(
     notebook.append_page(&content, Some(&tab_box));
     notebook.set_current_page(Some(tab_index - 1));
     terminal_widget.terminal.grab_focus();
+    attach_font_scroll_handler(&terminal_widget.terminal, config);
 
     terminal_widget.terminal.clone()
 }
@@ -535,6 +536,7 @@ fn split_current_tab(
     paned.set_start_child(Some(&existing_child));
     paned.set_end_child(Some(&new_terminal.scrolled));
     new_terminal.terminal.grab_focus();
+    attach_font_scroll_handler(&new_terminal.terminal, config);
 }
 
 fn close_focused_panel(window: &gtk::Window, notebook: &gtk::Notebook) -> bool {
@@ -724,6 +726,40 @@ fn spawn_shell(terminal: &Terminal, config: &Config) {
 struct TerminalWidget {
     scrolled: gtk::ScrolledWindow,
     terminal: Terminal,
+}
+
+fn attach_font_scroll_handler(terminal: &Terminal, config: &Rc<RefCell<Config>>) {
+    let ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let terminal = terminal.clone();
+    let terminal_ac = terminal.clone();
+    let config = config.clone();
+    ctrl.connect_scroll(move |ctrl, _dx, dy| {
+        let modifiers = ctrl
+            .current_event()
+            .map(|e| e.modifier_state())
+            .unwrap_or(gdk::ModifierType::empty());
+        if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+            && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+        {
+            let new_size = {
+                let mut cfg = config.borrow_mut();
+                cfg.font_size = if dy < 0.0 {
+                    (cfg.font_size + 1).min(72)
+                } else {
+                    (cfg.font_size - 1).max(6)
+                };
+                cfg.font_size
+            };
+            let cfg = config.borrow();
+            let mut font_desc = gtk::pango::FontDescription::from_string(&cfg.font);
+            font_desc.set_size(new_size * gtk::pango::SCALE);
+            terminal.set_font(Some(&font_desc));
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    terminal_ac.add_controller(ctrl);
 }
 
 fn create_terminal_widget(config: &Config) -> TerminalWidget {
