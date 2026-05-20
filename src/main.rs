@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Child, Command as StdCommand, Stdio};
 use std::rc::Rc;
 
 use clap::Parser;
@@ -36,6 +38,37 @@ struct Password {
 struct Passwords {
     passwords: Vec<Password>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DevCommand {
+    name: String,
+    dir: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct DevCommandsFile {
+    commands: Vec<DevCommand>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DevPidEntry {
+    name: String,
+    pid: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct DevPidsFile {
+    pids: Vec<DevPidEntry>,
+}
+
+struct RunningProcess {
+    pid: u32,
+    child: Option<Child>,
+    started_at: std::time::Instant,
+}
+
+type RunningProcesses = Rc<RefCell<HashMap<String, RunningProcess>>>;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -88,6 +121,7 @@ struct KeyBindings {
     focus_down: KeyBinding,
     ssh_manager: KeyBinding,
     password_manager: KeyBinding,
+    dev_manager: KeyBinding,
     tab_switch: Vec<KeyBinding>,
 }
 
@@ -115,6 +149,7 @@ struct RawKeyBindings {
     focus_down: Option<String>,
     ssh_manager: Option<String>,
     password_manager: Option<String>,
+    dev_manager: Option<String>,
     tab_1: Option<String>,
     tab_2: Option<String>,
     tab_3: Option<String>,
@@ -196,19 +231,28 @@ fn resolve_theme_path(config_path: &PathBuf, theme_file: &str) -> Option<PathBuf
 }
 
 fn main() {
+    diag_log("=== main() STARTED ===");
     let args = CliArgs::parse();
     let app = gtk::Application::new(
         Some("io.termilyon.app"),
-        gtk::gio::ApplicationFlags::FLAGS_NONE,
+        gtk::gio::ApplicationFlags::NON_UNIQUE,
     );
 
     app.connect_activate(move |app| build_ui(app, &args));
     app.run();
 }
 
+fn diag_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/termilyon_diag.txt") {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn build_ui(app: &gtk::Application, args: &CliArgs) {
     let config = Rc::new(RefCell::new(Config::load()));
     let tab_counter = Rc::new(Cell::new(1));
+    diag_log(&format!("=== build_ui started, dev_binding={:?}", config.borrow().keybindings.dev_manager));
 
     if let Some(path) = args.theme_file.as_ref() {
         config.borrow_mut().theme_file = Some(path.clone());
@@ -216,6 +260,7 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
 
     let window = gtk::ApplicationWindow::new(app);
     window.set_title(Some("Termilyon"));
+    window.set_icon_name(Some("termilyon"));
     window.set_default_size(1000, 700);
     window.set_decorated(false);
 
@@ -240,11 +285,68 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let notebook_clone = notebook.clone();
+    // Dev command manager — çalışan süreçleri tut
+    let running_processes: RunningProcesses = Rc::new(RefCell::new(HashMap::new()));
+    {
+        let mut running = running_processes.borrow_mut();
+        for entry in load_dev_pids() {
+            if process_is_running(entry.pid) {
+                running.insert(entry.name, RunningProcess { pid: entry.pid, child: None, started_at: std::time::Instant::now() });
+            }
+        }
+    }
+    // 2 saniyede bir çöken süreçleri tespit et
+    {
+        let running = running_processes.clone();
+        let window_weak = window.downgrade();
+        glib::timeout_add_seconds_local(2, move || {
+            let mut crashed = Vec::new();
+            let grace = std::time::Duration::from_secs(5);
+            {
+                let mut map = running.borrow_mut();
+                map.retain(|name, rp| {
+                    // Yeni başlatılan süreçlere grace period ver
+                    if rp.started_at.elapsed() < grace {
+                        return true;
+                    }
+                    if let Some(child) = rp.child.as_mut() {
+                        match child.try_wait() {
+                            Ok(None) => true, // hâlâ çalışıyor
+                            Ok(Some(status)) => {
+                                if !status.success() {
+                                    crashed.push(name.clone());
+                                }
+                                false // çıktı, map'ten kaldır
+                            }
+                            Err(_) => true, // kontrol edilemiyor, canlı say
+                        }
+                    } else {
+                        let alive = process_is_running(rp.pid);
+                        if !alive {
+                            crashed.push(name.clone());
+                        }
+                        alive
+                    }
+                });
+            }
+            if !crashed.is_empty() {
+                save_dev_pids(&running.borrow());
+                if let Some(win) = window_weak.upgrade() {
+                    let msg = format!("Komut çöktü: {}", crashed.join(", "));
+                    show_error_dialog(win.upcast_ref(), &msg);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let config_clone = config.clone();
     let counter_clone = tab_counter.clone();
     let window_clone = window.clone();
     let theme_override = args.theme_file.clone();
+    let running_processes_kb = running_processes.clone();
     controller.connect_key_pressed(move |_, key, _, state| {
+        diag_log(&format!("KEY key={key:?} state={state:?}"));
         if config_clone.borrow().keybindings.new_tab.matches(key, state) {
             create_tab(&notebook_clone, &config_clone, &counter_clone);
             return gtk::glib::Propagation::Stop;
@@ -356,7 +458,20 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             .ssh_manager
             .matches(key, state)
         {
-            show_ssh_manager_dialog(&window_clone, &notebook_clone);
+            let active_term = focused_terminal(window_clone.upcast_ref());
+            show_ssh_manager_dialog(&window_clone, active_term);
+            return gtk::glib::Propagation::Stop;
+        }
+
+        if config_clone
+            .borrow()
+            .keybindings
+            .dev_manager
+            .matches(key, state)
+        {
+            diag_log("DEV_MANAGER MATCHED — calling show_dev_manager_dialog");
+            show_dev_manager_dialog(&window_clone, running_processes_kb.clone());
+            diag_log("DEV_MANAGER — dialog returned");
             return gtk::glib::Propagation::Stop;
         }
 
@@ -367,7 +482,8 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             .matches(key, state)
         {
             let secret = config_clone.borrow().secret.clone();
-            show_password_manager_dialog(&window_clone, &notebook_clone, secret);
+            let active_term = focused_terminal(window_clone.upcast_ref());
+            show_password_manager_dialog(&window_clone, secret, active_term);
             return gtk::glib::Propagation::Stop;
         }
 
@@ -392,6 +508,30 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         gtk::glib::Propagation::Proceed
     });
     window.add_controller(controller);
+
+    // Son aktif split terminalini izle
+    let last_focused_terminal: Rc<RefCell<Option<Terminal>>> = Rc::new(RefCell::new(None));
+    {
+        let last_focused = last_focused_terminal.clone();
+        window.connect_notify_local(Some("focus-widget"), move |win, _| {
+            if let Some(widget) = gtk::prelude::GtkWindowExt::focus(win.upcast_ref::<gtk::Window>()) {
+                if let Ok(terminal) = widget.clone().downcast::<Terminal>() {
+                    *last_focused.borrow_mut() = Some(terminal);
+                }
+            }
+        });
+    }
+    // Pencere tekrar aktif olduğunda son split'e focus'u geri ver
+    {
+        let last_focused = last_focused_terminal.clone();
+        window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                if let Some(terminal) = last_focused.borrow().as_ref() {
+                    terminal.grab_focus();
+                }
+            }
+        });
+    }
 
     window.present();
 }
@@ -723,6 +863,39 @@ fn spawn_shell(terminal: &Terminal, config: &Config) {
     );
 }
 
+fn notify_attention_if_in_background(terminal: &Terminal, title: &str, body: &str) {
+    let is_active = terminal
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok())
+        .is_some_and(|w| w.is_active());
+
+    if is_active {
+        return;
+    }
+
+    let Some(app) = gtk::gio::Application::default() else { return };
+    let notification = gtk::gio::Notification::new(title);
+    notification.set_body(Some(body));
+    app.send_notification(Some("termilyon-attention"), &notification);
+}
+
+fn attach_attention_notifications(terminal: &Terminal) {
+    let terminal_clone = terminal.clone();
+    let last_notified = Rc::new(RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(10)));
+    terminal.connect_bell(move |_| {
+        // Bell can fire repeatedly; keep notifications readable.
+        let mut last = last_notified.borrow_mut();
+        if last.elapsed() >= std::time::Duration::from_secs(2) {
+            notify_attention_if_in_background(
+                &terminal_clone,
+                "Termilyon",
+                "Terminal kullanicidan girdi bekliyor olabilir.",
+            );
+            *last = std::time::Instant::now();
+        }
+    });
+}
+
 struct TerminalWidget {
     scrolled: gtk::ScrolledWindow,
     terminal: Terminal,
@@ -779,6 +952,7 @@ fn create_terminal_widget(config: &Config) -> TerminalWidget {
     }
 
     spawn_shell(&terminal, config);
+    attach_attention_notifications(&terminal);
 
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_child(Some(&terminal));
@@ -1312,7 +1486,7 @@ fn populate_password_list(list_box: &gtk::ListBox, passwords: &[Password]) {
 
 fn password_paste_selected(
     dialog: &gtk::Dialog,
-    notebook: &gtk::Notebook,
+    active_terminal: &Rc<RefCell<Option<Terminal>>>,
     list_box: &gtk::ListBox,
     passwords: &Rc<RefCell<Vec<Password>>>,
 ) {
@@ -1321,9 +1495,7 @@ fn password_paste_selected(
     let passwords_ref = passwords.borrow();
     let Some(pwd) = passwords_ref.get(index) else { return };
     let text = format!("{}\n", pwd.password);
-    let Some(page) = notebook.current_page() else { return };
-    let Some(child) = notebook.nth_page(Some(page)) else { return };
-    if let Some(terminal) = find_terminal_in_widget(&child) {
+    if let Some(terminal) = active_terminal.borrow().as_ref() {
         terminal.feed_child(text.as_bytes());
     }
     dialog.close();
@@ -1395,7 +1567,7 @@ fn show_add_password_dialog(
     dialog.present();
 }
 
-fn show_password_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Notebook, secret: String) {
+fn show_password_manager_dialog(window: &gtk::ApplicationWindow, secret: String, active_term: Option<Terminal>) {
     if secret.is_empty() {
         let dialog = gtk::Dialog::new();
         dialog.set_title(Some("Şifre Yöneticisi"));
@@ -1418,6 +1590,7 @@ fn show_password_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk:
         return;
     }
 
+    let active_terminal = Rc::new(RefCell::new(active_term));
     let secret = Rc::new(secret);
     let passwords = Rc::new(RefCell::new(load_passwords(&secret)));
 
@@ -1567,11 +1740,11 @@ fn show_password_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk:
     // Paste button
     {
         let dialog = dialog.clone();
-        let notebook = notebook.clone();
+        let active_terminal = active_terminal.clone();
         let passwords = passwords.clone();
         let list_box = list_box.clone();
         paste_btn.connect_clicked(move |_| {
-            password_paste_selected(&dialog, &notebook, &list_box, &passwords);
+            password_paste_selected(&dialog, &active_terminal, &list_box, &passwords);
         });
     }
 
@@ -1584,10 +1757,10 @@ fn show_password_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk:
     // Row activated: Enter or double-click → paste
     {
         let dialog = dialog.clone();
-        let notebook = notebook.clone();
+        let active_terminal = active_terminal.clone();
         let passwords = passwords.clone();
         list_box.connect_row_activated(move |lb, _| {
-            password_paste_selected(&dialog, &notebook, lb, &passwords);
+            password_paste_selected(&dialog, &active_terminal, lb, &passwords);
         });
     }
 
@@ -1675,7 +1848,7 @@ fn populate_server_list(list_box: &gtk::ListBox, servers: &[SshServer]) {
 
 fn ssh_connect_selected(
     dialog: &gtk::Dialog,
-    notebook: &gtk::Notebook,
+    active_terminal: &Rc<RefCell<Option<Terminal>>>,
     list_box: &gtk::ListBox,
     servers: &Rc<RefCell<Vec<SshServer>>>,
 ) {
@@ -1688,9 +1861,7 @@ fn ssh_connect_selected(
     } else {
         format!("ssh -p {} {}@{}\n", srv.port, srv.user, srv.host)
     };
-    let Some(page) = notebook.current_page() else { return };
-    let Some(child) = notebook.nth_page(Some(page)) else { return };
-    if let Some(terminal) = find_terminal_in_widget(&child) {
+    if let Some(terminal) = active_terminal.borrow().as_ref() {
         terminal.feed_child(cmd.as_bytes());
     }
     dialog.close();
@@ -1775,7 +1946,8 @@ fn show_add_server_dialog(
     dialog.present();
 }
 
-fn show_ssh_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Notebook) {
+fn show_ssh_manager_dialog(window: &gtk::ApplicationWindow, active_term: Option<Terminal>) {
+    let active_terminal = Rc::new(RefCell::new(active_term));
     let servers = Rc::new(RefCell::new(load_ssh_servers()));
 
     let dialog = gtk::Dialog::new();
@@ -1922,11 +2094,11 @@ fn show_ssh_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Note
     // Connect button
     {
         let dialog = dialog.clone();
-        let notebook = notebook.clone();
+        let active_terminal = active_terminal.clone();
         let servers = servers.clone();
         let list_box = list_box.clone();
         connect_btn.connect_clicked(move |_| {
-            ssh_connect_selected(&dialog, &notebook, &list_box, &servers);
+            ssh_connect_selected(&dialog, &active_terminal, &list_box, &servers);
         });
     }
 
@@ -1939,10 +2111,10 @@ fn show_ssh_manager_dialog(window: &gtk::ApplicationWindow, notebook: &gtk::Note
     // Row activated: Enter key or double-click
     {
         let dialog = dialog.clone();
-        let notebook = notebook.clone();
+        let active_terminal = active_terminal.clone();
         let servers = servers.clone();
         list_box.connect_row_activated(move |lb, _| {
-            ssh_connect_selected(&dialog, &notebook, lb, &servers);
+            ssh_connect_selected(&dialog, &active_terminal, lb, &servers);
         });
     }
 
@@ -1992,7 +2164,7 @@ fn close_tab_or_window(window: &gtk::Window, notebook: &gtk::Notebook) {
 fn default_keybindings() -> KeyBindings {
     KeyBindings {
         new_tab: parse_keybinding("Ctrl+Shift+T").unwrap(),
-        close_tab: parse_keybinding("Ctrl+Shift+W").unwrap(),
+        close_tab: parse_keybinding("Ctrl+Shift+Q").unwrap(),
         rename_tab: parse_keybinding("Ctrl+Shift+R").unwrap(),
         close_panel: parse_keybinding("Ctrl+D").unwrap(),
         split_vertical: parse_keybinding("Ctrl+Shift+P").unwrap(),
@@ -2007,6 +2179,7 @@ fn default_keybindings() -> KeyBindings {
         focus_down: parse_keybinding("Alt+Down").unwrap(),
         ssh_manager: parse_keybinding("Ctrl+Shift+S").unwrap(),
         password_manager: parse_keybinding("Ctrl+Shift+A").unwrap(),
+        dev_manager: parse_keybinding("Ctrl+Shift+B").unwrap(),
         tab_switch: (1..=9)
             .map(|n| parse_keybinding(&format!("Alt+{n}")).unwrap())
             .collect(),
@@ -2061,6 +2234,9 @@ fn apply_keybindings(bindings: &mut KeyBindings, raw: RawKeyBindings) {
     }
     if let Some(value) = raw.password_manager.and_then(|s| parse_keybinding(&s)) {
         bindings.password_manager = value;
+    }
+    if let Some(value) = raw.dev_manager.and_then(|s| parse_keybinding(&s)) {
+        bindings.dev_manager = value;
     }
 
     let tabs = [
@@ -2142,4 +2318,494 @@ fn focus_terminal_in_page(notebook: &gtk::Notebook, page: u32) {
             terminal.grab_focus();
         }
     }
+}
+
+// ── Dev Command Manager ────────────────────────────────────────────────────
+
+fn dev_commands_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "termilyon")
+        .map(|dirs| dirs.config_dir().join("dev_commands.toml"))
+}
+
+fn load_dev_commands() -> Vec<DevCommand> {
+    let Some(path) = dev_commands_path() else { return Vec::new() };
+    let Ok(content) = fs::read_to_string(&path) else { return Vec::new() };
+    toml::from_str::<DevCommandsFile>(&content)
+        .map(|f| f.commands)
+        .unwrap_or_default()
+}
+
+fn save_dev_commands(cmds: &[DevCommand]) {
+    let Some(path) = dev_commands_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let data = DevCommandsFile { commands: cmds.to_vec() };
+    if let Ok(content) = toml::to_string(&data) {
+        let _ = fs::write(&path, content);
+    }
+}
+
+fn dev_pids_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "termilyon")
+        .map(|dirs| dirs.data_local_dir().join("dev_pids.toml"))
+}
+
+fn save_dev_pids(running: &HashMap<String, RunningProcess>) {
+    let Some(path) = dev_pids_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let pids: Vec<DevPidEntry> = running
+        .iter()
+        .map(|(name, rp)| DevPidEntry { name: name.clone(), pid: rp.pid })
+        .collect();
+    let data = DevPidsFile { pids };
+    if let Ok(content) = toml::to_string(&data) {
+        let _ = fs::write(&path, content);
+    }
+}
+
+fn load_dev_pids() -> Vec<DevPidEntry> {
+    let Some(path) = dev_pids_path() else { return Vec::new() };
+    let Ok(content) = fs::read_to_string(&path) else { return Vec::new() };
+    toml::from_str::<DevPidsFile>(&content)
+        .map(|f| f.pids)
+        .unwrap_or_default()
+}
+
+fn log_path(name: &str) -> PathBuf {
+    let safe = name.replace(['/', '\\', ' ', ':'], "_");
+    let primary = PathBuf::from(format!("/var/log/termilyon/{safe}.log"));
+    if let Some(parent) = primary.parent() {
+        if fs::create_dir_all(parent).is_ok() {
+            return primary;
+        }
+    }
+    // Fallback: ~/.local/share/termilyon/logs/
+    if let Some(dirs) = ProjectDirs::from("", "", "termilyon") {
+        let log_dir = dirs.data_local_dir().join("logs");
+        let _ = fs::create_dir_all(&log_dir);
+        return log_dir.join(format!("{safe}.log"));
+    }
+    PathBuf::from(format!("/tmp/termilyon_{safe}.log"))
+}
+
+fn process_is_running(pid: u32) -> bool {
+    fs::metadata(format!("/proc/{pid}")).is_ok()
+}
+
+fn start_dev_command(cmd: &DevCommand, running: &RunningProcesses) -> Result<(), String> {
+    let log_file = fs::File::create(log_path(&cmd.name))
+        .map_err(|e| format!("Log dosyası oluşturulamadı: {e}"))?;
+    let log_stderr = log_file.try_clone()
+        .map_err(|e| format!("Log dosyası kopyalanamadı: {e}"))?;
+
+    let child = StdCommand::new("sh")
+        .arg("-c")
+        .arg(&cmd.command)
+        .current_dir(&cmd.dir)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_stderr))
+        .spawn()
+        .map_err(|e| format!("Komut başlatılamadı: {e}"))?;
+
+    let pid = child.id();
+    running.borrow_mut().insert(cmd.name.clone(), RunningProcess {
+        pid,
+        child: Some(child),
+        started_at: std::time::Instant::now(),
+    });
+    save_dev_pids(&running.borrow());
+    Ok(())
+}
+
+fn stop_dev_command(name: &str, running: &RunningProcesses) {
+    let mut map = running.borrow_mut();
+    if let Some(rp) = map.remove(name) {
+        if let Some(mut child) = rp.child {
+            let _ = child.kill();
+            let _ = child.wait(); // zombie'yi temizle
+        } else {
+            let _ = StdCommand::new("kill").arg(rp.pid.to_string()).status();
+        }
+    }
+    save_dev_pids(&map);
+}
+
+fn show_error_dialog(window: &gtk::Window, message: &str) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Hata"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(window));
+    dialog.add_button("Tamam", gtk::ResponseType::Ok);
+    let content = dialog.content_area();
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    let label = gtk::Label::new(Some(message));
+    label.set_wrap(true);
+    content.append(&label);
+    dialog.connect_response(|d, _| d.close());
+    dialog.present();
+}
+
+fn populate_dev_list(
+    list_box: &gtk::ListBox,
+    commands: &[DevCommand],
+    running: &RunningProcesses,
+) {
+    while let Some(row) = list_box.row_at_index(0) {
+        list_box.remove(&row);
+    }
+    let running_ref = running.borrow();
+    for cmd in commands {
+        let row = gtk::ListBoxRow::new();
+        row.set_widget_name(&cmd.name);
+
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        hbox.set_margin_top(6);
+        hbox.set_margin_bottom(6);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(8);
+
+        let name_label = gtk::Label::new(Some(&cmd.name));
+        name_label.set_halign(gtk::Align::Start);
+        name_label.set_hexpand(true);
+        hbox.append(&name_label);
+
+        let is_running = running_ref.contains_key(&cmd.name);
+        let status_label = gtk::Label::new(Some(if is_running { "Started" } else { "—" }));
+        status_label.set_halign(gtk::Align::End);
+        hbox.append(&status_label);
+
+        row.set_child(Some(&hbox));
+        list_box.append(&row);
+    }
+}
+
+fn reselect_row_by_name(list_box: &gtk::ListBox, name: &str) {
+    let mut i = 0;
+    loop {
+        match list_box.row_at_index(i) {
+            Some(row) if row.widget_name() == name => {
+                list_box.select_row(Some(&row));
+                break;
+            }
+            Some(_) => i += 1,
+            None => break,
+        }
+    }
+}
+
+fn show_add_dev_command_dialog(
+    parent: &gtk::Dialog,
+    list_box: &gtk::ListBox,
+    commands: &Rc<RefCell<Vec<DevCommand>>>,
+    running: &RunningProcesses,
+) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Add Command"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(parent));
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Add", gtk::ResponseType::Ok);
+    dialog.set_default_response(gtk::ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(8);
+
+    let name_label = gtk::Label::new(Some("Name:"));
+    name_label.set_halign(gtk::Align::End);
+    let name_entry = gtk::Entry::new();
+    name_entry.set_hexpand(true);
+    name_entry.set_activates_default(true);
+
+    let dir_label = gtk::Label::new(Some("Directory:"));
+    dir_label.set_halign(gtk::Align::End);
+    let dir_entry = gtk::Entry::new();
+    dir_entry.set_hexpand(true);
+    dir_entry.set_activates_default(true);
+
+    let cmd_label = gtk::Label::new(Some("Command:"));
+    cmd_label.set_halign(gtk::Align::End);
+    let cmd_entry = gtk::Entry::new();
+    cmd_entry.set_hexpand(true);
+    cmd_entry.set_activates_default(true);
+
+    grid.attach(&name_label, 0, 0, 1, 1);
+    grid.attach(&name_entry, 1, 0, 1, 1);
+    grid.attach(&dir_label, 0, 1, 1, 1);
+    grid.attach(&dir_entry, 1, 1, 1, 1);
+    grid.attach(&cmd_label, 0, 2, 1, 1);
+    grid.attach(&cmd_entry, 1, 2, 1, 1);
+    content.append(&grid);
+
+    let commands = commands.clone();
+    let list_box = list_box.clone();
+    let running = running.clone();
+    let name_entry_c = name_entry.clone();
+    let dir_entry_c = dir_entry.clone();
+    let cmd_entry_c = cmd_entry.clone();
+    dialog.connect_response(move |d, resp| {
+        if resp == gtk::ResponseType::Ok {
+            let name = name_entry_c.text().to_string();
+            let dir = dir_entry_c.text().to_string();
+            let command = cmd_entry_c.text().to_string();
+            if !name.is_empty() && !dir.is_empty() && !command.is_empty() {
+                commands.borrow_mut().push(DevCommand { name, dir, command });
+                save_dev_commands(&commands.borrow());
+                populate_dev_list(&list_box, &commands.borrow(), &running);
+            }
+        }
+        d.close();
+    });
+
+    name_entry.grab_focus();
+    dialog.present();
+}
+
+fn show_edit_dev_command_dialog(
+    parent: &gtk::Dialog,
+    list_box: &gtk::ListBox,
+    commands: &Rc<RefCell<Vec<DevCommand>>>,
+    running: &RunningProcesses,
+    original_name: &str,
+) {
+    let existing = commands.borrow().iter().find(|c| c.name == original_name).cloned();
+    let Some(existing) = existing else { return };
+
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Edit Command"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(parent));
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Save", gtk::ResponseType::Ok);
+    dialog.set_default_response(gtk::ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(8);
+
+    let name_label = gtk::Label::new(Some("Name:"));
+    name_label.set_halign(gtk::Align::End);
+    let name_entry = gtk::Entry::new();
+    name_entry.set_text(&existing.name);
+    name_entry.set_hexpand(true);
+    name_entry.set_activates_default(true);
+
+    let dir_label = gtk::Label::new(Some("Directory:"));
+    dir_label.set_halign(gtk::Align::End);
+    let dir_entry = gtk::Entry::new();
+    dir_entry.set_text(&existing.dir);
+    dir_entry.set_hexpand(true);
+    dir_entry.set_activates_default(true);
+
+    let cmd_label = gtk::Label::new(Some("Command:"));
+    cmd_label.set_halign(gtk::Align::End);
+    let cmd_entry = gtk::Entry::new();
+    cmd_entry.set_text(&existing.command);
+    cmd_entry.set_hexpand(true);
+    cmd_entry.set_activates_default(true);
+
+    grid.attach(&name_label, 0, 0, 1, 1);
+    grid.attach(&name_entry, 1, 0, 1, 1);
+    grid.attach(&dir_label, 0, 1, 1, 1);
+    grid.attach(&dir_entry, 1, 1, 1, 1);
+    grid.attach(&cmd_label, 0, 2, 1, 1);
+    grid.attach(&cmd_entry, 1, 2, 1, 1);
+    content.append(&grid);
+
+    let commands = commands.clone();
+    let list_box = list_box.clone();
+    let running = running.clone();
+    let original_name = original_name.to_string();
+    let name_entry_c = name_entry.clone();
+    let dir_entry_c = dir_entry.clone();
+    let cmd_entry_c = cmd_entry.clone();
+    dialog.connect_response(move |d, resp| {
+        if resp == gtk::ResponseType::Ok {
+            let new_name = name_entry_c.text().to_string();
+            let new_dir = dir_entry_c.text().to_string();
+            let new_cmd = cmd_entry_c.text().to_string();
+            if !new_name.is_empty() && !new_dir.is_empty() && !new_cmd.is_empty() {
+                // Çalışıyorsa durdur (isim değişebilir)
+                if running.borrow().contains_key(&original_name) {
+                    stop_dev_command(&original_name, &running);
+                }
+                let mut cmds = commands.borrow_mut();
+                if let Some(entry) = cmds.iter_mut().find(|c| c.name == original_name) {
+                    entry.name = new_name.clone();
+                    entry.dir = new_dir;
+                    entry.command = new_cmd;
+                }
+                save_dev_commands(&cmds);
+                drop(cmds);
+                populate_dev_list(&list_box, &commands.borrow(), &running);
+                reselect_row_by_name(&list_box, &new_name);
+            }
+        }
+        d.close();
+    });
+
+    name_entry.grab_focus();
+    dialog.present();
+}
+
+fn show_dev_manager_dialog(window: &gtk::ApplicationWindow, running: RunningProcesses) {
+    let commands = Rc::new(RefCell::new(load_dev_commands()));
+
+    let dialog = gtk::Dialog::new();
+    dialog.set_title(Some("Dev Commands"));
+    dialog.set_modal(true);
+    dialog.set_transient_for(Some(window));
+    dialog.set_default_size(500, 360);
+
+    let content = dialog.content_area();
+    content.set_spacing(8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let list_box = gtk::ListBox::new();
+    list_box.set_selection_mode(gtk::SelectionMode::Single);
+    list_box.set_vexpand(true);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_box));
+    scrolled.set_vexpand(true);
+    scrolled.set_min_content_height(220);
+    content.append(&scrolled);
+
+    populate_dev_list(&list_box, &commands.borrow(), &running);
+    if let Some(first) = list_box.row_at_index(0) {
+        list_box.select_row(Some(&first));
+    }
+
+    // Enter / double-click → başlat veya durdur
+    {
+        let commands = commands.clone();
+        let running = running.clone();
+        let list_box_mv = list_box.clone();
+        let window_weak = window.downgrade();
+        list_box.connect_row_activated(move |lb, row| {
+            let name = row.widget_name().to_string();
+            let is_running = running.borrow().contains_key(&name);
+            if is_running {
+                stop_dev_command(&name, &running);
+            } else {
+                let cmd = commands.borrow().iter().find(|c| c.name == name).cloned();
+                if let Some(cmd) = cmd {
+                    if let Err(e) = start_dev_command(&cmd, &running) {
+                        if let Some(win) = window_weak.upgrade() {
+                            show_error_dialog(win.upcast_ref(), &format!("{}: {e}", cmd.name));
+                        }
+                        return;
+                    }
+                }
+            }
+            populate_dev_list(&list_box_mv, &commands.borrow(), &running);
+            reselect_row_by_name(lb, &name);
+        });
+    }
+
+    // Butonlar
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btn_box.set_margin_top(4);
+    btn_box.set_halign(gtk::Align::End);
+    let add_btn = gtk::Button::with_label("Add");
+    let edit_btn = gtk::Button::with_label("Edit");
+    let delete_btn = gtk::Button::with_label("Delete");
+    let close_btn = gtk::Button::with_label("Close");
+    btn_box.append(&add_btn);
+    btn_box.append(&edit_btn);
+    btn_box.append(&delete_btn);
+    btn_box.append(&close_btn);
+    content.append(&btn_box);
+
+    // Add
+    {
+        let dialog_ref = dialog.clone();
+        let list_box = list_box.clone();
+        let commands = commands.clone();
+        let running = running.clone();
+        add_btn.connect_clicked(move |_| {
+            show_add_dev_command_dialog(&dialog_ref, &list_box, &commands, &running);
+        });
+    }
+
+    // Edit
+    {
+        let dialog_ref = dialog.clone();
+        let list_box = list_box.clone();
+        let commands = commands.clone();
+        let running = running.clone();
+        edit_btn.connect_clicked(move |_| {
+            if let Some(row) = list_box.selected_row() {
+                let name = row.widget_name().to_string();
+                show_edit_dev_command_dialog(&dialog_ref, &list_box, &commands, &running, &name);
+            }
+        });
+    }
+
+    // Delete
+    {
+        let list_box = list_box.clone();
+        let commands = commands.clone();
+        let running = running.clone();
+        delete_btn.connect_clicked(move |_| {
+            if let Some(row) = list_box.selected_row() {
+                let name = row.widget_name().to_string();
+                if running.borrow().contains_key(&name) {
+                    stop_dev_command(&name, &running);
+                }
+                commands.borrow_mut().retain(|c| c.name != name);
+                save_dev_commands(&commands.borrow());
+                populate_dev_list(&list_box, &commands.borrow(), &running);
+                if let Some(first) = list_box.row_at_index(0) {
+                    list_box.select_row(Some(&first));
+                }
+            }
+        });
+    }
+
+    // Close
+    {
+        let dialog_ref = dialog.clone();
+        close_btn.connect_clicked(move |_| dialog_ref.close());
+    }
+
+    // Escape
+    {
+        let ctrl = gtk::EventControllerKey::new();
+        let dialog_ref = dialog.clone();
+        ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                dialog_ref.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        dialog.add_controller(ctrl);
+    }
+
+    list_box.grab_focus();
+    dialog.present();
 }
