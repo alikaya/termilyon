@@ -44,6 +44,7 @@ shell = "/bin/bash"
 tab_title = "Terminal"
 tab_bar_position = "top"
 theme_file = "themes/catppuccin-mocha.toml"
+ssh_tab_bg = "#6F4E5A"
 
 [keybindings]
 new_tab = "Ctrl+Shift+T"
@@ -121,6 +122,11 @@ tab_active_fg = "#cdd6f4"
 tab_inactive_bg = "#181825"
 tab_inactive_fg = "#a6adc8"
 ```
+
+SSH tab color:
+
+- `ssh_tab_bg` sets the tab highlight color while an active SSH session is running in that tab.
+- Default value: `#6F4E5A`
 
 ## CLI
 
