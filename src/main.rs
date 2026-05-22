@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::rc::Rc;
@@ -79,6 +80,7 @@ struct Config {
     tab_title: String,
     tab_bar_position: gtk::PositionType,
     theme_file: Option<PathBuf>,
+    ssh_tab_bg: Option<String>,
     keybindings: KeyBindings,
     secret: String,
 }
@@ -92,6 +94,7 @@ struct RawConfig {
     tab_title: Option<String>,
     tab_bar_position: Option<String>,
     theme_file: Option<String>,
+    ssh_tab_bg: Option<String>,
     keybindings: Option<RawKeyBindings>,
     secret: Option<String>,
 }
@@ -172,6 +175,7 @@ impl Config {
             tab_title: "Terminal".to_string(),
             tab_bar_position: gtk::PositionType::Top,
             theme_file: None,
+            ssh_tab_bg: None,
             keybindings: default_keybindings(),
             secret: String::new(),
         };
@@ -201,6 +205,9 @@ impl Config {
                     }
                     if let Some(theme_file) = raw.theme_file {
                         config.theme_file = resolve_theme_path(&path, &theme_file);
+                    }
+                    if let Some(ssh_tab_bg) = raw.ssh_tab_bg {
+                        config.ssh_tab_bg = Some(ssh_tab_bg);
                     }
                     if let Some(raw_keys) = raw.keybindings {
                         apply_keybindings(&mut config.keybindings, raw_keys);
@@ -280,7 +287,23 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         .as_ref()
         .and_then(|path| theme_from_file(path));
     let first_terminal = create_tab(&notebook, &config, &tab_counter);
-    apply_tab_styles(&notebook, theme.as_ref(), Some(&first_terminal));
+    {
+        let cfg = config.borrow();
+        apply_tab_styles(&notebook, theme.as_ref(), Some(&first_terminal), Some(&cfg));
+    }
+    {
+        let cfg = config.borrow();
+        update_ssh_tab_indicators(&notebook, &cfg);
+    }
+    {
+        let notebook_ssh = notebook.clone();
+        let config_ssh = config.clone();
+        glib::timeout_add_seconds_local(2, move || {
+            let cfg = config_ssh.borrow();
+            update_ssh_tab_indicators(&notebook_ssh, &cfg);
+            glib::ControlFlow::Continue
+        });
+    }
 
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1066,6 +1089,7 @@ fn apply_tab_styles(
     notebook: &gtk::Notebook,
     theme: Option<&Theme>,
     terminal: Option<&Terminal>,
+    config: Option<&Config>,
 ) {
     let background = terminal
         .map(|terminal| terminal.color_background_for_draw())
@@ -1089,6 +1113,11 @@ fn apply_tab_styles(
     let inactive_fg = theme
         .and_then(|theme| theme.tab_inactive_fg.clone())
         .unwrap_or_else(|| with_alpha(&base_fg, 0.7));
+    let ssh_bg = theme
+        .map(|theme| theme.palette[2].clone())
+        .or_else(|| config.and_then(|cfg| cfg.ssh_tab_bg.as_deref().map(rgba)))
+        .unwrap_or_else(|| rgba("#6F4E5A"));
+    let ssh_fg = contrast_text_color(&ssh_bg);
 
     let mut css = format!(
         ".terminal-tabs > header {{ background-color: {}; }}",
@@ -1110,6 +1139,18 @@ fn apply_tab_styles(
     css.push_str(&format!(
         ".terminal-tabs tab:checked label, .terminal-tabs tab:checked button {{ color: {}; }}",
         active_fg.to_str()
+    ));
+    css.push_str(&format!(
+        ".terminal-tabs tab.ssh-connected {{ background-color: {}; background-image: none; border-image: none; }}",
+        ssh_bg.to_str()
+    ));
+    css.push_str(&format!(
+        ".terminal-tabs tab.ssh-connected:checked {{ background-color: {}; background-image: none; border-image: none; }}",
+        ssh_bg.to_str()
+    ));
+    css.push_str(&format!(
+        ".terminal-tabs tab.ssh-connected label, .terminal-tabs tab.ssh-connected button {{ color: {}; }}",
+        ssh_fg.to_str()
     ));
 
     let provider = gtk::CssProvider::new();
@@ -1141,7 +1182,7 @@ fn reload_config_and_theme(
 
     notebook.set_tab_pos(updated.tab_bar_position);
     let sample_terminal = find_first_terminal_in_notebook(notebook);
-    apply_tab_styles(notebook, theme.as_ref(), sample_terminal.as_ref());
+    apply_tab_styles(notebook, theme.as_ref(), sample_terminal.as_ref(), Some(&updated));
     apply_config_to_terminals(notebook, &updated, theme.as_ref());
 }
 
@@ -1203,6 +1244,95 @@ fn collect_terminals(widget: &gtk::Widget, terminals: &mut Vec<Terminal>) {
     while let Some(node) = child {
         collect_terminals(&node, terminals);
         child = node.next_sibling();
+    }
+}
+
+fn terminal_tty_name(terminal: &Terminal) -> Option<String> {
+    let pty = terminal.pty()?;
+    let fd = pty.fd().as_raw_fd();
+    let mut pty_num: libc::c_uint = 0;
+    // Convert PTY master fd -> slave pts/N, so `ps -t` can match shell children reliably.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGPTN, &mut pty_num) };
+    if rc == 0 {
+        return Some(format!("pts/{pty_num}"));
+    }
+    let link = fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let tty_path = link.to_string_lossy();
+    tty_path.strip_prefix("/dev/").map(|s| s.to_string())
+}
+
+fn terminal_has_active_ssh_session(terminal: &Terminal) -> bool {
+    let Some(tty) = terminal_tty_name(terminal) else { return false };
+    let output = StdCommand::new("ps")
+        .args(["-t", &tty, "-o", "args="])
+        .output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim_start)
+        .any(|args| {
+            (args == "ssh" || args.starts_with("ssh ") || args.contains("/ssh "))
+                && !args.contains("ssh-agent")
+        })
+}
+
+fn update_ssh_tab_indicators(notebook: &gtk::Notebook, config: &Config) {
+    let ssh_bg = config
+        .ssh_tab_bg
+        .as_deref()
+        .map(rgba)
+        .unwrap_or_else(|| rgba("#6F4E5A"));
+    let ssh_terminal_bg = with_alpha(&ssh_bg, 0.3);
+    thread_local! {
+        static BASE_BG: RefCell<HashMap<usize, gdk::RGBA>> = RefCell::new(HashMap::new());
+    }
+
+    for index in 0..notebook.n_pages() {
+        let Some(page) = notebook.nth_page(Some(index)) else { continue };
+        let mut terminals = Vec::new();
+        collect_terminals(&page, &mut terminals);
+        let terminal_states: Vec<(Terminal, bool)> = terminals
+            .into_iter()
+            .map(|terminal| {
+                let ssh_connected = terminal_has_active_ssh_session(&terminal);
+                (terminal, ssh_connected)
+            })
+            .collect();
+        let ssh_connected = terminal_states.iter().any(|(_, is_ssh)| *is_ssh);
+
+        for (terminal, terminal_ssh_connected) in terminal_states {
+            let key = terminal.as_ptr() as usize;
+            BASE_BG.with(|map| {
+                let mut map = map.borrow_mut();
+                map.entry(key)
+                    .or_insert_with(|| terminal.color_background_for_draw());
+                if terminal_ssh_connected {
+                    terminal.set_color_background(&ssh_terminal_bg);
+                } else if let Some(original) = map.get(&key) {
+                    terminal.set_color_background(original);
+                }
+            });
+        }
+
+        if let Some(tab_widget) = notebook.tab_label(&page) {
+            if let Some(tab_shell) = tab_widget.parent() {
+                if ssh_connected {
+                    tab_shell.add_css_class("ssh-connected");
+                } else {
+                    tab_shell.remove_css_class("ssh-connected");
+                }
+            }
+            if ssh_connected {
+                tab_widget.add_css_class("ssh-connected");
+            } else {
+                tab_widget.remove_css_class("ssh-connected");
+            }
+        }
     }
 }
 
