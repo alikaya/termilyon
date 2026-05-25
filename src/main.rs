@@ -1020,6 +1020,7 @@ struct Theme {
     foreground: gdk::RGBA,
     cursor: gdk::RGBA,
     palette: [gdk::RGBA; 16],
+    ssh_tab_bg: Option<gdk::RGBA>,
     tab_active_bg: Option<gdk::RGBA>,
     tab_active_fg: Option<gdk::RGBA>,
     tab_inactive_bg: Option<gdk::RGBA>,
@@ -1032,6 +1033,8 @@ struct ThemeConfig {
     foreground: String,
     cursor: String,
     palette: Vec<String>,
+    #[serde(alias = "ssh_tab_bh")]
+    ssh_tab_bg: Option<String>,
     tab_active_bg: Option<String>,
     tab_active_fg: Option<String>,
     tab_inactive_bg: Option<String>,
@@ -1064,6 +1067,7 @@ fn theme_from_file(path: &PathBuf) -> Option<Theme> {
         foreground: rgba(&raw.foreground),
         cursor: rgba(&raw.cursor),
         palette,
+        ssh_tab_bg: raw.ssh_tab_bg.as_deref().map(rgba),
         tab_active_bg: raw.tab_active_bg.as_deref().map(rgba),
         tab_active_fg: raw.tab_active_fg.as_deref().map(rgba),
         tab_inactive_bg: raw.tab_inactive_bg.as_deref().map(rgba),
@@ -1113,10 +1117,7 @@ fn apply_tab_styles(
     let inactive_fg = theme
         .and_then(|theme| theme.tab_inactive_fg.clone())
         .unwrap_or_else(|| with_alpha(&base_fg, 0.7));
-    let ssh_bg = theme
-        .map(|theme| theme.palette[2].clone())
-        .or_else(|| config.and_then(|cfg| cfg.ssh_tab_bg.as_deref().map(rgba)))
-        .unwrap_or_else(|| rgba("#6F4E5A"));
+    let ssh_bg = effective_ssh_bg(config, theme);
     let ssh_fg = contrast_text_color(&ssh_bg);
 
     let mut css = format!(
@@ -1163,6 +1164,14 @@ fn apply_tab_styles(
         );
     }
     notebook.queue_draw();
+}
+
+fn effective_ssh_bg(config: Option<&Config>, theme: Option<&Theme>) -> gdk::RGBA {
+    theme
+        .and_then(|theme| theme.ssh_tab_bg.clone())
+        .or_else(|| config.and_then(|cfg| cfg.ssh_tab_bg.as_deref().map(rgba)))
+        .or_else(|| theme.map(|theme| theme.palette[2].clone()))
+        .unwrap_or_else(|| rgba("#6F4E5A"))
 }
 
 fn reload_config_and_theme(
@@ -1256,15 +1265,13 @@ fn terminal_tty_name(terminal: &Terminal) -> Option<String> {
     if rc == 0 {
         return Some(format!("pts/{pty_num}"));
     }
-    let link = fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
-    let tty_path = link.to_string_lossy();
-    tty_path.strip_prefix("/dev/").map(|s| s.to_string())
+    None
 }
 
 fn terminal_has_active_ssh_session(terminal: &Terminal) -> bool {
     let Some(tty) = terminal_tty_name(terminal) else { return false };
     let output = StdCommand::new("ps")
-        .args(["-t", &tty, "-o", "args="])
+        .args(["-t", &tty, "-o", "comm="])
         .output();
     let Ok(output) = output else { return false };
     if !output.status.success() {
@@ -1274,19 +1281,16 @@ fn terminal_has_active_ssh_session(terminal: &Terminal) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .lines()
-        .map(str::trim_start)
-        .any(|args| {
-            (args == "ssh" || args.starts_with("ssh ") || args.contains("/ssh "))
-                && !args.contains("ssh-agent")
-        })
+        .map(str::trim)
+        .any(|comm| comm == "ssh")
 }
 
 fn update_ssh_tab_indicators(notebook: &gtk::Notebook, config: &Config) {
-    let ssh_bg = config
-        .ssh_tab_bg
-        .as_deref()
-        .map(rgba)
-        .unwrap_or_else(|| rgba("#6F4E5A"));
+    let theme = config
+        .theme_file
+        .as_ref()
+        .and_then(theme_from_file);
+    let ssh_bg = effective_ssh_bg(Some(config), theme.as_ref());
     let ssh_terminal_bg = with_alpha(&ssh_bg, 0.3);
     thread_local! {
         static BASE_BG: RefCell<HashMap<usize, gdk::RGBA>> = RefCell::new(HashMap::new());
@@ -1326,11 +1330,6 @@ fn update_ssh_tab_indicators(notebook: &gtk::Notebook, config: &Config) {
                 } else {
                     tab_shell.remove_css_class("ssh-connected");
                 }
-            }
-            if ssh_connected {
-                tab_widget.add_css_class("ssh-connected");
-            } else {
-                tab_widget.remove_css_class("ssh-connected");
             }
         }
     }

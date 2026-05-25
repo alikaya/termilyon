@@ -12,3 +12,5 @@
 .env.*
 *.log
 aur/
+.aur-repo/
+publish*
