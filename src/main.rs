@@ -304,6 +304,59 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             glib::ControlFlow::Continue
         });
     }
+    {
+        let notebook_close = notebook.clone();
+        let window_close = window.clone();
+        let allow_close = Rc::new(Cell::new(false));
+        let allow_close_in_cb = allow_close.clone();
+        window.connect_close_request(move |_| {
+            if allow_close_in_cb.get() {
+                allow_close_in_cb.set(false);
+                return gtk::glib::Propagation::Proceed;
+            }
+
+            if notebook_close.n_pages() <= 1 || !notebook_has_running_foreground_process(&notebook_close) {
+                return gtk::glib::Propagation::Proceed;
+            }
+
+            let dialog = gtk::Dialog::new();
+            dialog.set_title(Some("Termilyon"));
+            dialog.set_modal(true);
+            dialog.set_transient_for(Some(&window_close));
+            let no_btn = dialog.add_button("Hayır", gtk::ResponseType::No);
+            let yes_btn = dialog.add_button("Evet", gtk::ResponseType::Yes);
+
+            let content = dialog.content_area();
+            content.set_margin_top(14);
+            content.set_margin_bottom(14);
+            content.set_margin_start(18);
+            content.set_margin_end(18);
+            content.set_spacing(10);
+            no_btn.set_margin_bottom(10);
+            no_btn.set_margin_end(6);
+            yes_btn.set_margin_bottom(10);
+            yes_btn.set_margin_end(12);
+            let label = gtk::Label::new(Some(
+                "Açık diğer sekmelerde çalışan işler olabilir. Yine de uygulama kapatılsın mı?",
+            ));
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            content.append(&label);
+
+            let window_yes = window_close.clone();
+            let allow_close_yes = allow_close.clone();
+            dialog.connect_response(move |d, response| {
+                d.close();
+                if response == gtk::ResponseType::Yes {
+                    allow_close_yes.set(true);
+                    window_yes.close();
+                }
+            });
+            dialog.present();
+
+            gtk::glib::Propagation::Stop
+        });
+    }
 
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1254,6 +1307,38 @@ fn collect_terminals(widget: &gtk::Widget, terminals: &mut Vec<Terminal>) {
         collect_terminals(&node, terminals);
         child = node.next_sibling();
     }
+}
+
+fn notebook_has_running_foreground_process(notebook: &gtk::Notebook) -> bool {
+    for index in 0..notebook.n_pages() {
+        let Some(page) = notebook.nth_page(Some(index)) else { continue };
+        let mut terminals = Vec::new();
+        collect_terminals(&page, &mut terminals);
+        for terminal in terminals {
+            if terminal_has_running_process(&terminal) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn terminal_has_running_process(terminal: &Terminal) -> bool {
+    let Some(tty) = terminal_tty_name(terminal) else { return false };
+    let output = StdCommand::new("ps")
+        .args(["-t", &tty, "-o", "comm="])
+        .output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+
+    let shell_names = ["bash", "zsh", "sh", "dash", "fish", "nu"];
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .any(|comm| !comm.is_empty() && !shell_names.contains(&comm))
 }
 
 fn terminal_tty_name(terminal: &Terminal) -> Option<String> {
