@@ -81,6 +81,8 @@ struct Config {
     tab_bar_position: gtk::PositionType,
     theme_file: Option<PathBuf>,
     ssh_tab_bg: Option<String>,
+    split_resizer_hover_bg: Option<String>,
+    split_resizer_size: i32,
     keybindings: KeyBindings,
     secret: String,
 }
@@ -95,6 +97,8 @@ struct RawConfig {
     tab_bar_position: Option<String>,
     theme_file: Option<String>,
     ssh_tab_bg: Option<String>,
+    split_resizer_hover_bg: Option<String>,
+    split_resizer_size: Option<i32>,
     keybindings: Option<RawKeyBindings>,
     secret: Option<String>,
 }
@@ -176,6 +180,8 @@ impl Config {
             tab_bar_position: gtk::PositionType::Top,
             theme_file: None,
             ssh_tab_bg: None,
+            split_resizer_hover_bg: None,
+            split_resizer_size: 6,
             keybindings: default_keybindings(),
             secret: String::new(),
         };
@@ -208,6 +214,12 @@ impl Config {
                     }
                     if let Some(ssh_tab_bg) = raw.ssh_tab_bg {
                         config.ssh_tab_bg = Some(ssh_tab_bg);
+                    }
+                    if let Some(split_resizer_hover_bg) = raw.split_resizer_hover_bg {
+                        config.split_resizer_hover_bg = Some(split_resizer_hover_bg);
+                    }
+                    if let Some(split_resizer_size) = raw.split_resizer_size {
+                        config.split_resizer_size = split_resizer_size.max(1);
                     }
                     if let Some(raw_keys) = raw.keybindings {
                         apply_keybindings(&mut config.keybindings, raw_keys);
@@ -1074,6 +1086,7 @@ struct Theme {
     cursor: gdk::RGBA,
     palette: [gdk::RGBA; 16],
     ssh_tab_bg: Option<gdk::RGBA>,
+    split_resizer_hover_bg: Option<gdk::RGBA>,
     tab_active_bg: Option<gdk::RGBA>,
     tab_active_fg: Option<gdk::RGBA>,
     tab_inactive_bg: Option<gdk::RGBA>,
@@ -1088,6 +1101,7 @@ struct ThemeConfig {
     palette: Vec<String>,
     #[serde(alias = "ssh_tab_bh")]
     ssh_tab_bg: Option<String>,
+    split_resizer_hover_bg: Option<String>,
     tab_active_bg: Option<String>,
     tab_active_fg: Option<String>,
     tab_inactive_bg: Option<String>,
@@ -1121,6 +1135,7 @@ fn theme_from_file(path: &PathBuf) -> Option<Theme> {
         cursor: rgba(&raw.cursor),
         palette,
         ssh_tab_bg: raw.ssh_tab_bg.as_deref().map(rgba),
+        split_resizer_hover_bg: raw.split_resizer_hover_bg.as_deref().map(rgba),
         tab_active_bg: raw.tab_active_bg.as_deref().map(rgba),
         tab_active_fg: raw.tab_active_fg.as_deref().map(rgba),
         tab_inactive_bg: raw.tab_inactive_bg.as_deref().map(rgba),
@@ -1172,6 +1187,8 @@ fn apply_tab_styles(
         .unwrap_or_else(|| with_alpha(&base_fg, 0.7));
     let ssh_bg = effective_ssh_bg(config, theme);
     let ssh_fg = contrast_text_color(&ssh_bg);
+    let split_resizer_hover_bg = effective_split_resizer_hover_bg(config, theme, &background);
+    let split_resizer_size = config.map(|cfg| cfg.split_resizer_size).unwrap_or(6).max(1);
 
     let mut css = format!(
         ".terminal-tabs > header {{ background-color: {}; }}",
@@ -1206,6 +1223,15 @@ fn apply_tab_styles(
         ".terminal-tabs tab.ssh-connected label, .terminal-tabs tab.ssh-connected button {{ color: {}; }}",
         ssh_fg.to_str()
     ));
+    css.push_str(&format!(
+        "paned > separator {{ background-color: transparent; background-image: none; min-width: {}px; min-height: {}px; }}",
+        split_resizer_size,
+        split_resizer_size
+    ));
+    css.push_str(&format!(
+        "paned > separator:hover {{ background-color: {}; background-image: none; }}",
+        split_resizer_hover_bg.to_str()
+    ));
 
     let provider = gtk::CssProvider::new();
     provider.load_from_data(&css);
@@ -1225,6 +1251,19 @@ fn effective_ssh_bg(config: Option<&Config>, theme: Option<&Theme>) -> gdk::RGBA
         .or_else(|| config.and_then(|cfg| cfg.ssh_tab_bg.as_deref().map(rgba)))
         .or_else(|| theme.map(|theme| theme.palette[2].clone()))
         .unwrap_or_else(|| rgba("#6F4E5A"))
+}
+
+fn effective_split_resizer_hover_bg(
+    config: Option<&Config>,
+    theme: Option<&Theme>,
+    background: &gdk::RGBA,
+) -> gdk::RGBA {
+    theme
+        .and_then(|theme| theme.split_resizer_hover_bg.clone())
+        .or_else(|| {
+            config.and_then(|cfg| cfg.split_resizer_hover_bg.as_deref().map(rgba))
+        })
+        .unwrap_or_else(|| with_alpha(&adjust_luma(background, 1.2), 0.9))
 }
 
 fn reload_config_and_theme(

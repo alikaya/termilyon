@@ -7,6 +7,8 @@ tab_title = "Terminal"
 tab_bar_position = "top"
 theme_file = "themes/catppuccin-mocha.toml"
 ssh_tab_bg = "#6F4E5A"
+split_resizer_hover_bg = "#89B4FA"
+split_resizer_size = 3
 
 [keybindings]
 new_tab = "Ctrl+Shift+T"
