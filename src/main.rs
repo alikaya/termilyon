@@ -604,6 +604,7 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         window.connect_notify_local(Some("focus-widget"), move |win, _| {
             if let Some(widget) = gtk::prelude::GtkWindowExt::focus(win.upcast_ref::<gtk::Window>()) {
                 if let Ok(terminal) = widget.clone().downcast::<Terminal>() {
+                    record_focus(&terminal);
                     *last_focused.borrow_mut() = Some(terminal);
                 }
             }
@@ -614,7 +615,10 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
         let last_focused = last_focused_terminal.clone();
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
-                if let Some(terminal) = last_focused.borrow().as_ref() {
+                // grab_focus focus-notify'i tetikleyip borrow_mut deneyeceği için
+                // borrow'u kapatıp klonu kullan (reentrant borrow paniğini önler).
+                let terminal = last_focused.borrow().clone();
+                if let Some(terminal) = terminal {
                     terminal.grab_focus();
                 }
             }
@@ -630,7 +634,7 @@ fn create_tab(
     counter: &Rc<Cell<u32>>,
 ) -> Terminal {
     let config_ref = config.borrow();
-    let terminal_widget = create_terminal_widget(&config_ref);
+    let terminal_widget = create_terminal_widget(&config_ref, None);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
@@ -667,8 +671,8 @@ fn create_tab(
 
     tab_box.append(&close_button);
 
-    notebook.append_page(&content, Some(&tab_box));
-    notebook.set_current_page(Some(tab_index - 1));
+    let page_index = notebook.append_page(&content, Some(&tab_box));
+    notebook.set_current_page(Some(page_index));
     terminal_widget.terminal.grab_focus();
     attach_font_scroll_handler(&terminal_widget.terminal, config);
 
@@ -752,8 +756,11 @@ fn split_current_tab(
         .or_else(|| root_box.first_child());
     let Some(existing_child) = existing_child else { return };
 
+    // Yeni panel, aktif panelin bulunduğu klasörde başlasın.
+    let active_cwd = find_terminal_in_widget(&existing_child).and_then(|t| terminal_cwd(&t));
+
     let config_ref = config.borrow();
-    let new_terminal = create_terminal_widget(&config_ref);
+    let new_terminal = create_terminal_widget(&config_ref, active_cwd);
     let paned = gtk::Paned::new(orientation);
     paned.set_wide_handle(true);
     paned.set_hexpand(true);
@@ -899,6 +906,22 @@ fn collapse_paned(paned: gtk::Paned, removed: &gtk::ScrolledWindow) {
 
     let Some(remaining) = remaining else { return };
     replace_widget_in_parent(&paned.upcast::<gtk::Widget>(), &remaining);
+
+    // Panel kapandıktan sonra aynı sekmedeki en son aktif panele focus ver.
+    // (Arka plandaki bir sekmenin paneli kapanırsa focus çalınmasın diye
+    // yalnızca görünür sekme etkileniyorsa uygulanır.)
+    if let Some(notebook) = find_parent_notebook(&remaining) {
+        if let Some(current) = notebook.current_page() {
+            let in_current_page = notebook
+                .nth_page(Some(current))
+                .is_some_and(|child| is_descendant(&remaining, &child));
+            if in_current_page && !focus_last_active_in_page(&notebook, current) {
+                if let Some(terminal) = find_terminal_in_widget(&remaining) {
+                    terminal.grab_focus();
+                }
+            }
+        }
+    }
 }
 
 fn replace_widget_in_parent(old: &gtk::Widget, replacement: &gtk::Widget) {
@@ -929,10 +952,64 @@ fn find_scrolled_ancestor(widget: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
     None
 }
 
-fn spawn_shell(terminal: &Terminal, config: &Config) {
+thread_local! {
+    // En son focuslanan terminaller (en yeni sonda). Kapatılan panel sonrası
+    // "en son aktif panele" focus verebilmek için kullanılır.
+    static FOCUS_HISTORY: RefCell<Vec<Terminal>> = RefCell::new(Vec::new());
+}
+
+fn record_focus(terminal: &Terminal) {
+    FOCUS_HISTORY.with(|history| {
+        let mut history = history.borrow_mut();
+        // Kapatılmış (ağaçtan kopmuş) terminalleri ve mevcut kaydı temizle.
+        history.retain(|t| t.root().is_some() && t != terminal);
+        history.push(terminal.clone());
+    });
+}
+
+// Verilen sekmedeki en son aktif olan (hâlâ açık) terminale focus verir.
+fn focus_last_active_in_page(notebook: &gtk::Notebook, page: u32) -> bool {
+    let Some(page_child) = notebook.nth_page(Some(page)) else { return false };
+    // Hedefi borrow açıkken kopyala; grab_focus'u borrow bırakıldıktan sonra çağır.
+    // (grab_focus, focus-notify'i tetikleyip record_focus içinde reentrant borrow'a
+    // yol açar; borrow açıkken çağrılırsa "RefCell already borrowed" paniği olur.)
+    let target = FOCUS_HISTORY.with(|history| {
+        history
+            .borrow()
+            .iter()
+            .rev()
+            .find(|terminal| {
+                terminal.root().is_some()
+                    && is_descendant(terminal.upcast_ref::<gtk::Widget>(), &page_child)
+            })
+            .cloned()
+    });
+    match target {
+        Some(terminal) => {
+            terminal.grab_focus();
+            true
+        }
+        None => false,
+    }
+}
+
+fn is_descendant(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(node) = current {
+        if &node == ancestor {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn spawn_shell(terminal: &Terminal, config: &Config, cwd: Option<String>) {
     let shell = config.shell.clone();
     let argv = [shell.as_str()];
-    let cwd = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let cwd = cwd
+        .filter(|dir| std::path::Path::new(dir).is_dir())
+        .unwrap_or_else(|| env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
     terminal.spawn_async(
         PtyFlags::DEFAULT,
@@ -949,6 +1026,22 @@ fn spawn_shell(terminal: &Terminal, config: &Config) {
             }
         },
     );
+}
+
+// Aktif panelin (terminalin foreground process group'unun) çalışma dizinini döndürür.
+fn terminal_cwd(terminal: &Terminal) -> Option<String> {
+    let pty = terminal.pty()?;
+    let fd = pty.fd().as_raw_fd();
+    let pgrp = unsafe { libc::tcgetpgrp(fd) };
+    if pgrp <= 0 {
+        return None;
+    }
+    let target = fs::read_link(format!("/proc/{pgrp}/cwd")).ok()?;
+    if target.is_dir() {
+        target.into_os_string().into_string().ok()
+    } else {
+        None
+    }
 }
 
 fn notify_attention_if_in_background(terminal: &Terminal, title: &str, body: &str) {
@@ -1023,7 +1116,7 @@ fn attach_font_scroll_handler(terminal: &Terminal, config: &Rc<RefCell<Config>>)
     terminal_ac.add_controller(ctrl);
 }
 
-fn create_terminal_widget(config: &Config) -> TerminalWidget {
+fn create_terminal_widget(config: &Config, cwd: Option<String>) -> TerminalWidget {
     let terminal = Terminal::new();
     terminal.set_scrollback_lines(config.scrollback_lines.into());
 
@@ -1039,7 +1132,7 @@ fn create_terminal_widget(config: &Config) -> TerminalWidget {
         }
     }
 
-    spawn_shell(&terminal, config);
+    spawn_shell(&terminal, config, cwd);
     attach_attention_notifications(&terminal);
 
     let scrolled = gtk::ScrolledWindow::new();
