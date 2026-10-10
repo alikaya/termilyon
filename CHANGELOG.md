@@ -5,6 +5,15 @@ All notable changes to Termilyon are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-10-10
+
+### Added
+- **Move a panel to another tab** — `Shift+Alt+1..9` moves the focused panel to
+  tab N, placing it below that tab's most recently active panel, and moves focus
+  along with it. If tab N does not exist, the panel is moved into a new tab. The
+  source tab is closed when its last panel is moved out. The shortcuts work on
+  any keyboard layout, even though `Shift+digit` produces a symbol (e.g. `!`).
+
 ## [0.1.12] - 2026-07-01
 
 ### Added
@@ -25,4 +34,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a tab that had multiple panels. The same reentrancy issue on window
   re-activation was hardened as well.
 
+[0.1.13]: https://github.com/alikaya/termilyon/releases/tag/v0.1.13
 [0.1.12]: https://github.com/alikaya/termilyon/releases/tag/v0.1.12
