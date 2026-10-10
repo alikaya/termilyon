@@ -152,6 +152,7 @@ Defaults (all can be changed via config):
 - `Ctrl+Shift+A`: Password manager (add/delete/paste)
 - `Alt+Left/Right/Up/Down`: move focus between splits
 - `Alt+1..9`: switch tab
+- `Shift+Alt+1..9`: move focused panel to that tab, below its last active panel (opens a new tab if it does not exist; the source tab closes if it becomes empty)
 
 ## Split/Exit Behavior
 

@@ -130,6 +130,7 @@ struct KeyBindings {
     password_manager: KeyBinding,
     dev_manager: KeyBinding,
     tab_switch: Vec<KeyBinding>,
+    move_panel_to_tab: Vec<KeyBinding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -433,7 +434,7 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
     let window_clone = window.clone();
     let theme_override = args.theme_file.clone();
     let running_processes_kb = running_processes.clone();
-    controller.connect_key_pressed(move |_, key, _, state| {
+    controller.connect_key_pressed(move |controller, key, keycode, state| {
         diag_log(&format!("KEY key={key:?} state={state:?}"));
         if config_clone.borrow().keybindings.new_tab.matches(key, state) {
             create_tab(&notebook_clone, &config_clone, &counter_clone);
@@ -575,6 +576,30 @@ fn build_ui(app: &gtk::Application, args: &CliArgs) {
             return gtk::glib::Propagation::Stop;
         }
 
+        // Shift basılıyken rakam tuşları sembol üretir (Shift+1 → "!"), bu yüzden
+        // panel taşıma kısayolları tuşun Shift'siz haliyle eşleştirilir.
+        let unshifted_key = gdk::Display::default()
+            .and_then(|display| {
+                display.translate_key(keycode, gdk::ModifierType::empty(), controller.group() as i32)
+            })
+            .map_or(key, |(unshifted, ..)| unshifted);
+        let move_target = config_clone
+            .borrow()
+            .keybindings
+            .move_panel_to_tab
+            .iter()
+            .position(|binding| binding.matches(unshifted_key, state));
+        if let Some(index) = move_target {
+            move_focused_panel_to_tab(
+                window_clone.upcast_ref(),
+                &notebook_clone,
+                &config_clone,
+                &counter_clone,
+                index as u32,
+            );
+            return gtk::glib::Propagation::Stop;
+        }
+
         for (index, binding) in config_clone
             .borrow()
             .keybindings
@@ -633,12 +658,26 @@ fn create_tab(
     config: &Rc<RefCell<Config>>,
     counter: &Rc<Cell<u32>>,
 ) -> Terminal {
+    let terminal_widget = create_terminal_widget(&config.borrow(), None);
+    append_tab(notebook, config, counter, terminal_widget.scrolled.upcast_ref());
+    terminal_widget.terminal.grab_focus();
+    attach_font_scroll_handler(&terminal_widget.terminal, config);
+
+    terminal_widget.terminal.clone()
+}
+
+// Verilen paneli içeren yeni bir sekme ekler, onu seçer ve sekmenin kök kutusunu döndürür.
+fn append_tab(
+    notebook: &gtk::Notebook,
+    config: &Rc<RefCell<Config>>,
+    counter: &Rc<Cell<u32>>,
+    panel: &gtk::Widget,
+) -> gtk::Box {
     let config_ref = config.borrow();
-    let terminal_widget = create_terminal_widget(&config_ref, None);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
-    content.append(&terminal_widget.scrolled);
+    content.append(panel);
 
     let tab_index = counter.get();
     counter.set(tab_index + 1);
@@ -673,10 +712,8 @@ fn create_tab(
 
     let page_index = notebook.append_page(&content, Some(&tab_box));
     notebook.set_current_page(Some(page_index));
-    terminal_widget.terminal.grab_focus();
-    attach_font_scroll_handler(&terminal_widget.terminal, config);
 
-    terminal_widget.terminal.clone()
+    content
 }
 
 fn close_current_tab(
@@ -761,17 +798,86 @@ fn split_current_tab(
 
     let config_ref = config.borrow();
     let new_terminal = create_terminal_widget(&config_ref, active_cwd);
+    split_with(&existing_child, new_terminal.scrolled.upcast_ref(), orientation);
+    new_terminal.terminal.grab_focus();
+    attach_font_scroll_handler(&new_terminal.terminal, config);
+}
+
+// `existing` paneli böler; `new_child` sağa (Horizontal) ya da alta (Vertical) yerleşir.
+fn split_with(existing: &gtk::Widget, new_child: &gtk::Widget, orientation: gtk::Orientation) {
     let paned = gtk::Paned::new(orientation);
     paned.set_wide_handle(true);
     paned.set_hexpand(true);
     paned.set_vexpand(true);
 
-    replace_widget_in_parent(&existing_child, paned.upcast_ref());
+    replace_widget_in_parent(existing, paned.upcast_ref());
 
-    paned.set_start_child(Some(&existing_child));
-    paned.set_end_child(Some(&new_terminal.scrolled));
-    new_terminal.terminal.grab_focus();
-    attach_font_scroll_handler(&new_terminal.terminal, config);
+    paned.set_start_child(Some(existing));
+    paned.set_end_child(Some(new_child));
+}
+
+// Odaktaki paneli `target` sıralı sekmeye taşır (son aktif panelinin altına).
+// Hedef sekme yoksa yeni sekme açılır; kaynak sekmede panel kalmazsa sekme kapanır.
+fn move_focused_panel_to_tab(
+    window: &gtk::Window,
+    notebook: &gtk::Notebook,
+    config: &Rc<RefCell<Config>>,
+    counter: &Rc<Cell<u32>>,
+    target: u32,
+) {
+    let Some(source) = notebook.current_page() else { return };
+    if source == target {
+        return;
+    }
+    let Some(source_root) = notebook.nth_page(Some(source)) else { return };
+    let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else { return };
+    let Some(scrolled) = find_scrolled_ancestor(&focus) else { return };
+    let Some(terminal) = find_terminal_in_widget(scrolled.upcast_ref()) else { return };
+    let Some(parent) = scrolled.parent() else { return };
+    let panel = scrolled.clone().upcast::<gtk::Widget>();
+
+    // Hedefi panel yerinden çıkarılmadan önce belirle; sonradan vazgeçilirse panel kaybolur.
+    let target_page = if target < notebook.n_pages() {
+        let Some(root) = notebook.nth_page(Some(target)) else { return };
+        let anchor = last_active_in_page(notebook, target)
+            .and_then(|t| find_scrolled_ancestor(t.upcast_ref()))
+            .map(|s| s.upcast::<gtk::Widget>())
+            .or_else(|| root.first_child());
+        let Some(anchor) = anchor else { return };
+        Some((root, anchor))
+    } else {
+        None
+    };
+
+    let source_emptied = match parent.downcast::<gtk::Paned>() {
+        Ok(paned) => {
+            collapse_paned(paned, &scrolled);
+            false
+        }
+        Err(parent) => {
+            let Ok(root_box) = parent.downcast::<gtk::Box>() else { return };
+            root_box.remove(&panel);
+            true
+        }
+    };
+
+    let target_root = match target_page {
+        Some((root, anchor)) => {
+            split_with(&anchor, &panel, gtk::Orientation::Vertical);
+            root
+        }
+        None => append_tab(notebook, config, counter, &panel).upcast(),
+    };
+
+    if source_emptied {
+        if let Some(page) = notebook.page_num(&source_root) {
+            notebook.remove_page(Some(page));
+        }
+    }
+    if let Some(page) = notebook.page_num(&target_root) {
+        notebook.set_current_page(Some(page));
+    }
+    terminal.grab_focus();
 }
 
 fn close_focused_panel(window: &gtk::Window, notebook: &gtk::Notebook) -> bool {
@@ -969,11 +1075,23 @@ fn record_focus(terminal: &Terminal) {
 
 // Verilen sekmedeki en son aktif olan (hâlâ açık) terminale focus verir.
 fn focus_last_active_in_page(notebook: &gtk::Notebook, page: u32) -> bool {
-    let Some(page_child) = notebook.nth_page(Some(page)) else { return false };
-    // Hedefi borrow açıkken kopyala; grab_focus'u borrow bırakıldıktan sonra çağır.
-    // (grab_focus, focus-notify'i tetikleyip record_focus içinde reentrant borrow'a
-    // yol açar; borrow açıkken çağrılırsa "RefCell already borrowed" paniği olur.)
-    let target = FOCUS_HISTORY.with(|history| {
+    match last_active_in_page(notebook, page) {
+        Some(terminal) => {
+            terminal.grab_focus();
+            true
+        }
+        None => false,
+    }
+}
+
+// Verilen sekmedeki en son aktif olan (hâlâ açık) terminali döndürür.
+fn last_active_in_page(notebook: &gtk::Notebook, page: u32) -> Option<Terminal> {
+    let page_child = notebook.nth_page(Some(page))?;
+    // Hedefi borrow açıkken kopyala; grab_focus'u çağıran taraf borrow bırakıldıktan
+    // sonra çağırır. (grab_focus, focus-notify'i tetikleyip record_focus içinde
+    // reentrant borrow'a yol açar; borrow açıkken çağrılırsa "RefCell already
+    // borrowed" paniği olur.)
+    FOCUS_HISTORY.with(|history| {
         history
             .borrow()
             .iter()
@@ -983,14 +1101,7 @@ fn focus_last_active_in_page(notebook: &gtk::Notebook, page: u32) -> bool {
                     && is_descendant(terminal.upcast_ref::<gtk::Widget>(), &page_child)
             })
             .cloned()
-    });
-    match target {
-        Some(terminal) => {
-            terminal.grab_focus();
-            true
-        }
-        None => false,
-    }
+    })
 }
 
 fn is_descendant(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
@@ -1585,6 +1696,11 @@ fn show_keybindings_dialog(window: &gtk::ApplicationWindow, config: &Config) {
 
     for (index, binding) in config.keybindings.tab_switch.iter().enumerate() {
         let title = format!("Switch tab {}", index + 1);
+        add_keybinding_row(&list, &title, binding);
+    }
+
+    for (index, binding) in config.keybindings.move_panel_to_tab.iter().enumerate() {
+        let title = format!("Move panel to tab {}", index + 1);
         add_keybinding_row(&list, &title, binding);
     }
 
@@ -2528,6 +2644,9 @@ fn default_keybindings() -> KeyBindings {
         dev_manager: parse_keybinding("Ctrl+Shift+B").unwrap(),
         tab_switch: (1..=9)
             .map(|n| parse_keybinding(&format!("Alt+{n}")).unwrap())
+            .collect(),
+        move_panel_to_tab: (1..=9)
+            .map(|n| parse_keybinding(&format!("Shift+Alt+{n}")).unwrap())
             .collect(),
     }
 }
